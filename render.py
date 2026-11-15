@@ -103,21 +103,18 @@ def render_spherex_table(fig, filepath, ra_col="RA", dec_col="DEC", z_col="Z", i
         for attempt in range(max_retries):
             try:
                 with fits.open(spectral_image_url, memmap=False) as hdulist:
-                    for hdu in hdulist:
-                        hdu.data
+                    df = Table(hdulist[1].data).to_pandas()
                 break
             except (TimeoutError, urllib.error.HTTPError, http.client.IncompleteRead):
                 if attempt == max_retries - 1:
                     raise
-                time.sleep(10 * (attempt + 1))
+                time.sleep(10 * (attempt + 1)) 
+          if df is None:
+            df = Table.read(filepath).to_pandas()
+        else:
+          df = pd.read_csv(filepath)
 
     
-    """if filepath.endswith((".fits", ".fit")):
-       df = Table.read(filepath).to_pandas()
-   else:
-       df = pd.read_csv(filepath)
-"""
-
    cols = [ra_col, dec_col, z_col] + ([ir_col] if ir_col else [])
    df = df[cols].dropna().head(max_rows)
 
