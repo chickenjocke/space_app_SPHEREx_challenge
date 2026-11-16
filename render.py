@@ -97,7 +97,7 @@ def render_spherex_live_nasa(fig, ra_deg=304.6935, dec_deg=42.4436, max_rows=250
     ra_col  = 's_ra'
     dec_col = 's_deg'
 
-    df['Z'] = df['em_min'].fillna(1.0) 5.0
+    df['Z'] = df['em_min'].fillna(1.0) / 5.0
     distances = cosmo.comoving_distance(df['Z'].values)
 
     coords = SkyCoord(
