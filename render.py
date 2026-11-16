@@ -11,10 +11,6 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
-import astropy.units as u
-from astropy.coordinates import SkyCoord
-from astropy.cosmology import Planck18 as cosmo
-from astroquery.ipac.irsa import Irsa
 
 st.set_page_config(page_title="SPHEREx 3D Infrared Explorer", layout="wide")
 
@@ -110,7 +106,7 @@ def _value(record: dict, *names: str) -> str:
 @st.cache_data(ttl=1800, show_spinner=False)
 def query_spherex_products(ra_deg: float, dec_deg: float, radius_deg: float) -> list[dict]:
     """Query IRSA's generic SIA endpoint for wide and deep SPHEREx products."""
-    products, seen, errors = [], set(), []
+    products, seen = [], set()
     for collection in SPHEREX_COLLECTIONS:
         try:
             response = requests.get(
@@ -126,18 +122,28 @@ def query_spherex_products(ra_deg: float, dec_deg: float, radius_deg: float) -> 
             response.raise_for_status()
             if not response.content.strip():
                 continue
-            for record in _parse_votable(response.content):
+            current_records = _parse_votable(response.content)
+            if not current_records:
+                continue
+
+            for record in current_records:
                 key = _value(record, "obs_publisher_did", "obs_id", "access_url", "access_reference")
                 if key and key not in seen:
                     seen.add(key)
                     record["_collection"] = collection
                     products.append(record)
-        except (requests.RequestException, ET.ParseError) as exc:
-            errors.append(f"{collection}: {exc}")
-    
-    # Fallback to astroquery if HTTP SIA returns nothing
+
+            if products:
+                break
+        except (requests.RequestException, ET.ParseError):
+            continue
+
     if not products:
         try:
+            import astropy.units as u
+            from astropy.coordinates import SkyCoord
+            from astroquery.ipac.irsa import Irsa
+
             coord = SkyCoord(ra_deg, dec_deg, unit="deg")
             results = Irsa.query_sia(pos=(coord, radius_deg * u.deg), collection=list(SPHEREX_COLLECTIONS))
             if len(results) > 0:
@@ -150,7 +156,7 @@ def query_spherex_products(ra_deg: float, dec_deg: float, radius_deg: float) -> 
                         "em_min": float(row.get("em_min", 1.5)) if pd.notna(row.get("em_min")) else 1.5,
                         "em_max": float(row.get("em_max", 3.0)) if pd.notna(row.get("em_max")) else 3.0,
                         "access_url": str(row.get("access_url", "")),
-                        "_collection": "astroquery_fallback"
+                        "_collection": "astroquery_fallback",
                     })
         except Exception:
             pass
@@ -179,6 +185,7 @@ def download_fits(url: str) -> bytes:
 
 def _fits_planes(raw: bytes) -> list[dict]:
     from astropy.io import fits
+
     planes = []
     with fits.open(io.BytesIO(raw), memmap=False) as hdus:
         for index, hdu in enumerate(hdus):
@@ -204,7 +211,6 @@ def create_space_scene(title="3D Space Renderer", num_bg_stars=600, bg_radius=80
     theta = np.arccos(costheta)
     r = np.random.uniform(bg_radius * 0.8, bg_radius, num_bg_stars)
 
-    # Distant background starfield
     fig.add_trace(go.Scatter3d(
         x=r * np.sin(theta) * np.cos(phi),
         y=r * np.sin(theta) * np.sin(phi),
@@ -230,8 +236,6 @@ def create_space_scene(title="3D Space Renderer", num_bg_stars=600, bg_radius=80
 def _show_products(products: list[dict], target_name: str, ra_deg: float, dec_deg: float, selected_year: int):
     if not products:
         st.info("No SPHEREx product covers this target position. Generating spatial field distribution from database coordinates.")
-        
-        # Build synthetic/database scatter points around target coordinates
         np.random.seed(int(ra_deg + dec_deg))
         n_points = 200
         df = pd.DataFrame({
@@ -300,7 +304,6 @@ def _show_products(products: list[dict], target_name: str, ra_deg: float, dec_de
                     paper_bgcolor="#111827", plot_bgcolor="#111827", font_color="white", height=650)
                 st.plotly_chart(figure, use_container_width=True)
 
-        # Build DataFrame from query results for 3D mapping
         df_list = []
         for idx, rec in enumerate(products):
             try:
@@ -318,12 +321,14 @@ def _show_products(products: list[dict], target_name: str, ra_deg: float, dec_de
             'RA': [ra_deg], 'DEC': [dec_deg], 'IR_Flux': [1.5], 'Z': [0.5], 'Year': [selected_year], 'ObjectName': [target_name]
         })
 
-    # Filter by timeline year
     filtered_df = df[df['Year'] == selected_year]
     if len(filtered_df) == 0:
-        filtered_df = df.head(50)  # Fallback if year doesn't match strictly
+        filtered_df = df.head(50)
 
-    # 3D Cartesian Coordinate Transformation via Astropy Cosmology
+    from astropy.cosmology import Planck18 as cosmo
+    import astropy.units as u
+    from astropy.coordinates import SkyCoord
+
     distances = cosmo.comoving_distance(filtered_df['Z'].values)
     coords = SkyCoord(
         ra=filtered_df['RA'].values * u.deg,
@@ -383,7 +388,7 @@ def main():
     with st.form("spherex_search"):
         submitted = st.form_submit_button("Find SPHEREx infrared data & render 3D", type="primary")
 
-    if submitted or "spherex_products" not in st.session_state:
+    if submitted:
         if not target.strip():
             st.error("Enter a target name or JPL Horizons ID.")
         else:
@@ -400,7 +405,6 @@ def main():
                     products = query_spherex_products(ra_deg, dec_deg, float(radius))
                 st.session_state["spherex_products"] = products
             except Exception as exc:
-                # Fallback coordinates if Horizons offline
                 ra_deg, dec_deg = 304.6935, 42.4436
                 st.session_state["last_target"] = {"name": target.strip(), "date": obs_date, "ra": ra_deg, "dec": dec_deg}
                 st.session_state["spherex_products"] = []
@@ -412,7 +416,7 @@ def main():
         products = st.session_state.get("spherex_products", [])
         _show_products(products, t_info["name"], t_info["ra"], t_info["dec"], selected_year)
 
-    st.markdown("Sources: [JPL Horizons](https://ssd.jpl.nasa.gov/api/horizons.api.html) · [IRSA SPHEREx](https://irsa.ipac.caltech.edu/Missions/spherex.html) · [IRSA SIA documentation](https://irsa.ipac.caltech.edu/ibe/sia.html)")
+    st.markdown("Sources: [JPL Horizons](https://ssd.jpl.nasa.gov/api/horizons.api.html) · [IRSA SPHEREx](https://irsa.ipac.caltech.edu/Missions/spherex.html) · [IRSA SIA documentation](https://irsa.ipac.caltech.edu/IRSA.html)")
 
 
 if __name__ == "__main__":
