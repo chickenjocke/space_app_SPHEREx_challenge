@@ -13,11 +13,9 @@ from astropy.cosmology import Planck18 as cosmo
 import astropy.units as u
 from astroquery.ipac.irsa import Irsa
 
-""" 
-  BOILERPLATE CODE TO RENDER PLANETS(CREATED AS A BOILERPLATE BEFOREHAND;
-  DOES NOT RENDER REAL PLANETS OR USE NASA DATA, ONLY TO SHOW PLANETS!
-  AI USED IN CREATION OF SECTION TO CORRECTLY DESIGN PLANETS
-"""
+#  BOILERPLATE CODE TO RENDER PLANETS(CREATED AS A BOILERPLATE BEFOREHAND;
+#  DOES NOT RENDER REAL PLANETS OR USE NASA DATA, ONLY TO SHOW PLANETS!
+#  AI USED IN CREATION OF SECTION TO CORRECTLY DESIGN PLANETS
 
 def create_space_scene(title="3D Space Renderer", num_bg_stars=400, bg_radius=5000):
    fig = go.Figure()
@@ -87,7 +85,7 @@ def create_space_scene(title="3D Space Renderer", num_bg_stars=400, bg_radius=50
 
 def render_spherex_live_nasa(fig, ra_deg=304.6935, dec_deg=42.4436, max_rows=25000):
     coord = SkyCoord(ra_deg, dec_deg, unit="deg")
-    search_radius = 1 * u.arsec
+    search_radius = 1 * u.arcsec
     print(f"Sending HTTPS request to NASA IRSA for values: RA, {ra_deg}, Dec: {dec_deg}...")
     results = Irsa.query_sia(pos=(coord, search_radius), collection = ['spherex_dr1', 'spherex_qr3'])
     if len(results) == 0:
@@ -95,7 +93,7 @@ def render_spherex_live_nasa(fig, ra_deg=304.6935, dec_deg=42.4436, max_rows=250
       
     df = results.to_table().to_pandas().head(max_rows)
     ra_col  = 's_ra'
-    dec_col = 's_deg'
+    dec_col = 's_dec'
 
     df['Z'] = df['em_min'].fillna(1.0) / 5.0
     distances = cosmo.comoving_distance(df['Z'].values)
