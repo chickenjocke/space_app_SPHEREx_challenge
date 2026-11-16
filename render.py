@@ -92,9 +92,45 @@ def render_spherex_live_nasa(fig, ra_deg=304.6935, dec_deg=42.4436, max_rows=250
     results = Irsa.query_sia(pos=(coord, search_radius), collection = ['spherex_dr1', 'spherex_qr3'])
     if len(results) = 0:
         raise ValueError("No SPHEREx data found for these coordinates.")
+      
     df = results.to_table().to_pandas().head(max_rows)
     ra_col  = 's_ra'
     dec_col = 's_deg'
+
+    df['Z'] = df['em_min'].fillna(1.0) 5.0
+    distances = cosmo.comoving_distance(df['Z'].values)
+
+    coords = SkyCoord(
+        ra=df[ra_col].values * u.deg,
+        dec=df[dec_col].values * u.deg,
+        distance=distances
+    )
+
+    color_values = df['em_min'] # Infrared wavelength band indicator
+    color_label = "Infrared Wavelength (um)"
+
+    fig.add_trace(go.Scatter3d(
+        x=coords.cartesian.x.value,
+        y=coords.cartesian.y.value,
+        z=coords.cartesian.z.value,
+        mode="markers",
+        name="NASA SPHEREx Live Data",
+        hovertemplate=(
+            f"<b>SPHEREx IR Source</b><br>"
+            f"RA: %{{customdata[0]:.3f}}°<br>"
+            f"Dec: %{{customdata[1]:.3f}}°<br>"
+            f"{color_label}: %{{customdata[2]:.3f}} µm<extra></extra>"
+        ),
+        customdata=np.stack((df[ra_col].values, df[dec_col].values, color_values.values), axis=-1),
+        marker=dict(
+            size=3.0,
+            color=color_values,
+            colorscale="Inferno",
+            colorbar=dict(title=color_label, x=0.92),
+            opacity=0.9
+        )
+    ))
+    return fig
 
 
 if __name__ == "__main__":
