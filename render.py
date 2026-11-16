@@ -134,13 +134,15 @@ def render_spherex_live_nasa(fig, ra_deg=304.6935, dec_deg=42.4436, max_rows=250
 
 
 if __name__ == "__main__":
-   fig = create_space_scene(title="SPHEREx 3D Infrared Sky Map", bg_radius=5000)
-   fig = render_spherex_table(
-       fig,
-       filepath="spherex_data.fits",
-       ra_col="RA",
-       dec_col="DEC",
-       z_col="Z",
-       ir_col="FLUX_BAND_1"
-   )
-   fig.show()
+   fig = create_space_scene(title="SPHEREx Live 3D Infrared Sky Map", bg_radius=5000)
+   
+   fig = render_spherex_live_nasa(fig, ra_deg=304.6935, dec_deg=42.4436)
+   
+   try:
+       import streamlit as st
+       st.set_page_config(page_title="SPHEREx 3D Infrared Sky Map", layout="wide")
+       st.title("NASA SPHEREx 3D Time-Evolving Infrared Sky Map")
+       st.markdown("Interactive 3D visualization mapping real-time NASA IRSA infrared spectral data.")
+       st.plotly_chart(fig, use_container_width=True)
+   except Exception:
+       fig.show()
