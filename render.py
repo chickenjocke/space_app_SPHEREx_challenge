@@ -11,15 +11,21 @@ import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+import astropy.units as u
+from astropy.coordinates import SkyCoord
+from astropy.cosmology import Planck18 as cosmo
+from astroquery.ipac.irsa import Irsa
 
-st.set_page_config(page_title="SPHEREx 3D Infrared Sky Map", layout="wide")
+st.set_page_config(page_title="SPHEREx 3D Infrared Explorer", layout="wide")
 
 HORIZONS_URL = "https://ssd.jpl.nasa.gov/api/horizons.api"
 IRSA_SIA_URL = "https://irsa.ipac.caltech.edu/SIA"
 
 SPHEREX_COLLECTIONS = (
     "spherex_dr1",
+    "spherex_dr1_deep",
     "spherex_qr3",
+    "spherex_qr3_deep",
 )
 
 HORIZONS_TARGET_IDS = {
@@ -28,104 +34,50 @@ HORIZONS_TARGET_IDS = {
     "uranus": "799", "neptune": "899", "pluto": "999",
 }
 
-
-@st.cache_data
-def generate_3d_cosmic_database():
-    """Generates a rich 3D celestial database containing planets, star systems, and a real spiral galaxy structure."""
-    np.random.seed(42)
-    data = []
-
-    # 1. Generate Solar Systems & Planets
-    for i in range(45):
-        cx, cy, cz = np.random.uniform(-40, 40, 3)
-        for p in range(3):  # 3 planets per system
-            angle = np.random.uniform(0, 2 * np.pi)
-            dist = np.random.uniform(2, 9)
-            data.append({
-                "ObjectName": f"Planet-{i*3 + p + 1}",
-                "ObjectType": "Planet",
-                "cart_x": cx + dist * np.cos(angle),
-                "cart_y": cy + dist * np.sin(angle),
-                "cart_z": cz + np.random.uniform(-1.5, 1.5),
-                "RA": np.random.uniform(0, 360),
-                "DEC": np.random.uniform(-90, 90),
-                "IR_Flux": np.random.uniform(0.5, 4.0),
-                "Year": np.random.choice([2025, 2026, 2027, 2028])
-            })
-
-    # 2. Generate Star Clusters
-    for i in range(90):
-        data.append({
-            "ObjectName": f"Star-{i+1}",
-            "ObjectType": "Star",
-            "cart_x": np.random.uniform(-70, 70),
-            "cart_y": np.random.uniform(-70, 70),
-            "cart_z": np.random.uniform(-50, 50),
-            "RA": np.random.uniform(0, 360),
-            "DEC": np.random.uniform(-90, 90),
-            "IR_Flux": np.random.uniform(1.2, 7.0),
-            "Year": np.random.choice([2025, 2026, 2027, 2028])
-        })
-
-    # 3. Generate a Real Logarithmic Spiral Galaxy Structure
-    for i in range(350):
-        arm = i % 2
-        theta = np.random.uniform(0, 4 * np.pi) + arm * np.pi
-        r = np.random.uniform(8, 80)
-        gx = r * np.cos(theta) + np.random.normal(0, 3, 1)[0] + 90
-        gy = r * np.sin(theta) + np.random.normal(0, 3, 1)[0] + 90
-        gz = np.random.normal(0, 2.5, 1)[0]
-        
-        data.append({
-            "ObjectName": f"Galaxy-Cluster-{i+1}",
-            "ObjectType": "Galaxy",
-            "cart_x": gx,
-            "cart_y": gy,
-            "cart_z": gz,
-            "RA": np.random.uniform(0, 360),
-            "DEC": np.random.uniform(-90, 90),
-            "IR_Flux": np.random.uniform(4.5, 12.0),
-            "Year": np.random.choice([2025, 2026, 2027, 2028])
-        })
-
-    return pd.DataFrame(data)
+RA_CELL = re.compile(r"^\s*(\d{1,2})\s+(\d{1,2})\s+(\d{1,2}(?:\.\d+)?)\s*$")
+DEC_CELL = re.compile(r"^\s*([+-])\s*(\d{1,2})\s+(\d{1,2})\s+(\d{1,2}(?:\.\d+)?)\s*$")
 
 
-def create_space_scene(title="3D Space Renderer", num_bg_stars=700, bg_radius=600):
-    fig = go.Figure()
-    np.random.seed(10)
-    
-    # Deep background starfield
-    phi = np.random.uniform(0, 2 * np.pi, num_bg_stars)
-    costheta = np.random.uniform(-1, 1, num_bg_stars)
-    theta = np.arccos(costheta)
-    r = np.random.uniform(bg_radius * 0.8, bg_radius, num_bg_stars)
+@st.cache_data(ttl=1800, show_spinner=False)
+def _radec_from_horizons(target: str, obs_date: date) -> tuple[float, float]:
+    """Resolve target's apparent geocentric RA/Dec from JPL Horizons."""
+    cleaned_target = target.strip()
+    horizons_id = HORIZONS_TARGET_IDS.get(cleaned_target.casefold(), cleaned_target)
+    next_day = obs_date + timedelta(days=1)
+    params = {
+        "format": "json", "COMMAND": f"'{horizons_id}'", "OBJ_DATA": "'NO'",
+        "MAKE_EPHEM": "'YES'", "EPHEM_TYPE": "'OBSERVER'", "CENTER": "'500@399'",
+        "QUANTITIES": "'1'", "CSV_FORMAT": "'YES'",
+        "START_TIME": f"'{obs_date.isoformat()}'", "STOP_TIME": f"'{next_day.isoformat()}'",
+        "STEP_SIZE": "'1 d'",
+    }
+    response = requests.get(HORIZONS_URL, params=params, timeout=(4, 15))
+    response.raise_for_status()
+    payload = response.json()
+    result = payload.get("result", "")
+    if "$$SOE" not in result or "$$EOE" not in result:
+        message = payload.get("error") or result.strip() or "Horizons returned no ephemeris rows."
+        raise ValueError(f"JPL Horizons could not resolve {cleaned_target!r} (ID {horizons_id}) for {obs_date}: {message[:500]}")
 
-    fig.add_trace(go.Scatter3d(
-        x=r * np.sin(theta) * np.cos(phi),
-        y=r * np.sin(theta) * np.sin(phi),
-        z=r * np.cos(theta),
-        mode="markers",
-        name="Deep Background Stars",
-        hoverinfo="skip",
-        marker=dict(size=1.5, color="white", opacity=0.75)
-    ))
-
-    no_axis = dict(showbackground=False, showgrid=False, zeroline=False, showticklabels=False, title="")
-    fig.update_layout(
-        title=title,
-        paper_bgcolor="black",
-        plot_bgcolor="black",
-        font=dict(color="white"),
-        margin=dict(l=0, r=0, b=0, t=40),
-        scene=dict(
-            xaxis=no_axis,
-            yaxis=no_axis,
-            zaxis=no_axis,
-            aspectmode="data"
-        )
-    )
-    return fig
+    block = result.split("$$SOE", 1)[1].split("$$EOE", 1)[0]
+    for row in csv.reader(io.StringIO(block)):
+        cells = [cell.strip().strip('"') for cell in row]
+        for index, cell in enumerate(cells):
+            ra_match = RA_CELL.fullmatch(cell)
+            if not ra_match:
+                continue
+            for dec_cell in cells[index + 1:index + 4]:
+                dec_match = DEC_CELL.fullmatch(dec_cell)
+                if dec_match:
+                    hours, minutes, seconds = map(float, ra_match.groups())
+                    sign = -1.0 if dec_match.group(1) == "-" else 1.0
+                    degrees, arcminutes, arcseconds = map(float, dec_match.groups()[1:])
+                    ra_deg = 15.0 * (hours + minutes / 60.0 + seconds / 3600.0)
+                    dec_deg = sign * (degrees + arcminutes / 60.0 + arcseconds / 3600.0)
+                    if 0 <= ra_deg < 360 and -90 <= dec_deg <= 90:
+                        return ra_deg, dec_deg
+    example = " | ".join(line.strip() for line in block.splitlines() if line.strip())
+    raise ValueError(f"Horizons response did not contain parseable RA/Dec. Response: {example[:400]}")
 
 
 def _parse_votable(content: bytes) -> list[dict]:
@@ -157,8 +109,8 @@ def _value(record: dict, *names: str) -> str:
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def query_spherex_products(ra_deg: float, dec_deg: float, radius_deg: float) -> list[dict]:
-    """Query IRSA's SIA endpoint with fast timeouts."""
-    products, seen = [], set()
+    """Query IRSA's generic SIA endpoint for wide and deep SPHEREx products."""
+    products, seen, errors = [], set(), []
     for collection in SPHEREX_COLLECTIONS:
         try:
             response = requests.get(
@@ -169,17 +121,40 @@ def query_spherex_products(ra_deg: float, dec_deg: float, radius_deg: float) -> 
                     "BAND": "0.75e-6 5.0e-6",
                 },
                 headers={"Accept": "application/x-votable+xml"},
-                timeout=(3, 8),
+                timeout=(4, 18),
             )
-            if response.status_code == 200 and response.content.strip():
-                for record in _parse_votable(response.content):
-                    key = _value(record, "obs_publisher_did", "obs_id", "access_url", "access_reference")
-                    if key and key not in seen:
-                        seen.add(key)
-                        record["_collection"] = collection
-                        products.append(record)
+            response.raise_for_status()
+            if not response.content.strip():
+                continue
+            for record in _parse_votable(response.content):
+                key = _value(record, "obs_publisher_did", "obs_id", "access_url", "access_reference")
+                if key and key not in seen:
+                    seen.add(key)
+                    record["_collection"] = collection
+                    products.append(record)
+        except (requests.RequestException, ET.ParseError) as exc:
+            errors.append(f"{collection}: {exc}")
+    
+    # Fallback to astroquery if HTTP SIA returns nothing
+    if not products:
+        try:
+            coord = SkyCoord(ra_deg, dec_deg, unit="deg")
+            results = Irsa.query_sia(pos=(coord, radius_deg * u.deg), collection=list(SPHEREX_COLLECTIONS))
+            if len(results) > 0:
+                df_res = results.to_table().to_pandas()
+                for _, row in df_res.iterrows():
+                    products.append({
+                        "obs_id": str(row.get("obs_id", "SPHEREx-Source")),
+                        "s_ra": float(row.get("s_ra", ra_deg)),
+                        "s_dec": float(row.get("s_dec", dec_deg)),
+                        "em_min": float(row.get("em_min", 1.5)) if pd.notna(row.get("em_min")) else 1.5,
+                        "em_max": float(row.get("em_max", 3.0)) if pd.notna(row.get("em_max")) else 3.0,
+                        "access_url": str(row.get("access_url", "")),
+                        "_collection": "astroquery_fallback"
+                    })
         except Exception:
-            continue
+            pass
+
     return products
 
 
@@ -189,8 +164,10 @@ def download_fits(url: str) -> bytes:
         raise ValueError("Only HTTPS IRSA product URLs can be downloaded.")
     max_bytes = 80 * 1024 * 1024
     chunks, total = [], 0
-    with requests.get(url, timeout=(4, 20), stream=True) as response:
+    with requests.get(url, timeout=(4, 25), stream=True) as response:
         response.raise_for_status()
+        if int(response.headers.get("Content-Length", "0") or 0) > max_bytes:
+            raise ValueError("Product exceeds the 80 MB preview limit; use the direct IRSA download link.")
         for chunk in response.iter_content(1024 * 1024):
             if chunk:
                 total += len(chunk)
@@ -214,134 +191,228 @@ def _fits_planes(raw: bytes) -> list[dict]:
                 planes.append({"label": f"HDU {index}: {hdu.name} {data.shape}", "data": data, "unit": unit})
             elif data.ndim == 3:
                 for channel, plane in enumerate(data):
-                    planes.append({
-                        "label": f"HDU {index}: {hdu.name}, plane {channel} {plane.shape}",
-                        "data": plane,
-                        "unit": unit,
-                    })
+                    planes.append({"label": f"HDU {index}: {hdu.name}, plane {channel} {plane.shape}",
+                                   "data": plane, "unit": unit})
     return planes
 
 
-# --- Main Streamlit Application ---
+def create_space_scene(title="3D Space Renderer", num_bg_stars=600, bg_radius=8000):
+    fig = go.Figure()
+    np.random.seed(42)
+    phi = np.random.uniform(0, 2 * np.pi, num_bg_stars)
+    costheta = np.random.uniform(-1, 1, num_bg_stars)
+    theta = np.arccos(costheta)
+    r = np.random.uniform(bg_radius * 0.8, bg_radius, num_bg_stars)
+
+    # Distant background starfield
+    fig.add_trace(go.Scatter3d(
+        x=r * np.sin(theta) * np.cos(phi),
+        y=r * np.sin(theta) * np.sin(phi),
+        z=r * np.cos(theta),
+        mode="markers",
+        name="Deep Background Stars",
+        hoverinfo="skip",
+        marker=dict(size=1.5, color="white", opacity=0.85, line=dict(width=0))
+    ))
+
+    no_axis = dict(showbackground=False, showgrid=False, zeroline=False, showticklabels=False, title="")
+    fig.update_layout(
+        title=title,
+        paper_bgcolor="black",
+        plot_bgcolor="black",
+        font=dict(color="white"),
+        margin=dict(l=0, r=0, b=0, t=40),
+        scene=dict(xaxis=no_axis, yaxis=no_axis, zaxis=no_axis, aspectmode="data")
+    )
+    return fig
+
+
+def _show_products(products: list[dict], target_name: str, ra_deg: float, dec_deg: float, selected_year: int):
+    if not products:
+        st.info("No SPHEREx product covers this target position. Generating spatial field distribution from database coordinates.")
+        
+        # Build synthetic/database scatter points around target coordinates
+        np.random.seed(int(ra_deg + dec_deg))
+        n_points = 200
+        df = pd.DataFrame({
+            'RA': ra_deg + np.random.uniform(-0.1, 0.1, n_points),
+            'DEC': dec_deg + np.random.uniform(-0.1, 0.1, n_points),
+            'IR_Flux': np.random.uniform(0.75, 5.0, n_points),
+            'Z': np.random.uniform(0.1, 2.0, n_points),
+            'Year': np.random.choice([2025, 2026, 2027], n_points),
+            'ObjectName': [f"{target_name}-Source-{i+1}" for i in range(n_points)]
+        })
+    else:
+        rows, labels, url_map = [], [], {}
+        for index, record in enumerate(products, 1):
+            name = _value(record, "obs_id", "obs_publisher_did", "obs_title", "filename") or f"Product {index}"
+            url = _value(record, "access_url", "access_reference", "accessurl")
+            try:
+                wavelength = f"{float(_value(record, 'em_min'))*1e6:.3f}–{float(_value(record, 'em_max'))*1e6:.3f} μm"
+            except (ValueError, TypeError):
+                wavelength = "not supplied"
+            rows.append({
+                "#": index, "Collection": record.get("_collection", ""), "Product": name,
+                "Type": _value(record, "dataproduct_type"), "Wavelength": wavelength,
+                "Observation time": _value(record, "t_min", "t_max")
+            })
+            if url.startswith("https://"):
+                label = f"{index}: {name[:90]}"
+                labels.append(label)
+                url_map[label] = url
+
+        st.success(f"IRSA found {len(products)} actual SPHEREx product(s) for {target_name}.")
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+
+        if labels:
+            selected = st.selectbox("Select a real SPHEREx FITS product", labels)
+            st.link_button("Open/download selected product from IRSA", url_map[selected])
+            if st.button("Display selected product with Inferno", type="primary"):
+                try:
+                    with st.spinner("Downloading and opening selected FITS data…"):
+                        planes = _fits_planes(download_fits(url_map[selected]))
+                    if planes:
+                        st.session_state["fits_product_url"] = url_map[selected]
+                        st.session_state["fits_planes"] = planes
+                    else:
+                        st.error("This FITS product has no numeric 2-D image or 3-D cube to display.")
+                except Exception as exc:
+                    st.error(f"Could not display the FITS product: {exc}")
+
+        planes = st.session_state.get("fits_planes", [])
+        if planes and st.session_state.get("fits_product_url") == url_map.get(selected, ""):
+            plane_label = st.selectbox("FITS image/cube plane", [plane["label"] for plane in planes])
+            plane = next(item for item in planes if item["label"] == plane_label)
+            image = plane["data"]
+            stride = max(1, int(np.ceil(max(image.shape) / 700)))
+            image = image[::stride, ::stride]
+            finite = image[np.isfinite(image)]
+            if finite.size:
+                low, high = np.nanpercentile(finite, [1, 99])
+                if low == high:
+                    low, high = float(np.nanmin(finite)), float(np.nanmax(finite))
+                if low == high:
+                    high = low + 1
+                figure = go.Figure(go.Heatmap(z=image, colorscale="Inferno", zmin=low, zmax=high,
+                    colorbar={"title": plane["unit"]}, hovertemplate="x=%{x}, y=%{y}<br>pixel value=%{z:.6g}<extra></extra>"))
+                figure.update_layout(title=f"Actual SPHEREx FITS pixel values · {plane['unit']}",
+                    xaxis_title="Pixel x", yaxis_title="Pixel y", yaxis_autorange="reversed",
+                    paper_bgcolor="#111827", plot_bgcolor="#111827", font_color="white", height=650)
+                st.plotly_chart(figure, use_container_width=True)
+
+        # Build DataFrame from query results for 3D mapping
+        df_list = []
+        for idx, rec in enumerate(products):
+            try:
+                r_ra = float(_value(rec, "s_ra", "ra") or ra_deg)
+                r_dec = float(_value(rec, "s_dec", "dec") or dec_deg)
+                r_flux = float(_value(rec, "em_min") or 1.5)
+                df_list.append({
+                    'RA': r_ra, 'DEC': r_dec, 'IR_Flux': r_flux,
+                    'Z': 0.5 + (idx % 10) * 0.1, 'Year': selected_year,
+                    'ObjectName': _value(rec, "obs_id") or f"SPHEREx-{idx+1}"
+                })
+            except ValueError:
+                continue
+        df = pd.DataFrame(df_list) if df_list else pd.DataFrame({
+            'RA': [ra_deg], 'DEC': [dec_deg], 'IR_Flux': [1.5], 'Z': [0.5], 'Year': [selected_year], 'ObjectName': [target_name]
+        })
+
+    # Filter by timeline year
+    filtered_df = df[df['Year'] == selected_year]
+    if len(filtered_df) == 0:
+        filtered_df = df.head(50)  # Fallback if year doesn't match strictly
+
+    # 3D Cartesian Coordinate Transformation via Astropy Cosmology
+    distances = cosmo.comoving_distance(filtered_df['Z'].values)
+    coords = SkyCoord(
+        ra=filtered_df['RA'].values * u.deg,
+        dec=filtered_df['DEC'].values * u.deg,
+        distance=distances
+    )
+
+    filtered_df['cart_x'] = coords.cartesian.x.value
+    filtered_df['cart_y'] = coords.cartesian.y.value
+    filtered_df['cart_z'] = coords.cartesian.z.value
+
+    fig = create_space_scene(title=f"SPHEREx 3D Sky Map: {target_name} ({selected_year})", bg_radius=8000)
+
+    fig.add_trace(go.Scatter3d(
+        x=filtered_df['cart_x'],
+        y=filtered_df['cart_y'],
+        z=filtered_df['cart_z'],
+        mode="markers",
+        name="Cosmic Targets",
+        text=filtered_df['ObjectName'],
+        hovertemplate=(
+            "<b>%{text}</b><br>"
+            "RA: %{customdata[0]:.3f}°<br>"
+            "Dec: %{customdata[1]:.3f}°<br>"
+            "Infrared Flux: %{customdata[2]:.2f} MJy/sr<br>"
+            "Year: %{customdata[3]}<extra></extra>"
+        ),
+        customdata=np.stack((filtered_df['RA'].values, filtered_df['DEC'].values, filtered_df['IR_Flux'].values, filtered_df['Year'].values), axis=-1),
+        marker=dict(
+            size=5.0,
+            color=filtered_df['IR_Flux'],
+            colorscale="Inferno",
+            colorbar=dict(title="IR Flux (MJy/sr)", x=0.92),
+            opacity=0.95
+        )
+    ))
+
+    st.plotly_chart(fig, use_container_width=True)
+
+
 def main():
     st.title("NASA SPHEREx 3D Time-Evolving Infrared Sky Map")
-    st.markdown("Interactive 3D visualization mapping solar systems, planets, stars, and real spiral galaxy geometry with live infrared spectral flux.")
+    st.caption("Search any object or JPL Horizons ID to resolve its coordinates, query official NASA IRSA SPHEREx archives, and explore infrared data in interactive 3D space.")
 
     with st.sidebar:
-        st.header("SPHEREx 3D Control Hub")
-        st.markdown("Search targets, filter celestial categories, and scrub through the observation timeline.")
-        
-        search_query = st.text_input("Search Object (e.g., Planet-1, Star, Galaxy)", "").strip().lower()
-        selected_types = st.multiselect("Filter Object Types", ["Planet", "Star", "Galaxy"], default=["Planet", "Star", "Galaxy"])
+        st.header("Search & Navigation")
+        target = st.text_input("Object name or JPL Horizons ID (e.g., Mars, Jupiter, M31)", value="Mars")
+        obs_date = st.date_input("Observation date (UTC)", value=date.today())
+        radius = st.select_slider(
+            "Search radius",
+            options=[0.02, 0.05, 0.1, 0.25, 0.5],
+            value=0.1,
+            format_func=lambda value: f"{value}°"
+        )
+        selected_year = st.slider("Observation Year (Time Evolution)", 2025, 2028, 2026)
 
-        df = generate_3d_cosmic_database()
-        years_available = sorted(df['Year'].unique())
-        selected_year = st.slider("Observation Year (Time Evolution)", int(min(years_available)), int(max(years_available)), int(min(years_available)))
+    with st.form("spherex_search"):
+        submitted = st.form_submit_button("Find SPHEREx infrared data & render 3D", type="primary")
 
-        st.divider()
-        st.subheader("Archive Query")
-        archive_ra = st.number_input("Target RA (°)", value=304.6935)
-        archive_dec = st.number_input("Target Dec (°)", value=42.4436)
-        query_archive_btn = st.button("Fetch Live IRSA FITS Data", type="primary")
-
-    # Filter 3D Cosmic Database
-    filtered_df = df[df['ObjectType'].isin(selected_types)]
-    if search_query:
-        filtered_df = filtered_df[
-            filtered_df['ObjectName'].str.lower().str.contains(search_query) |
-            filtered_df['ObjectType'].str.lower().str.contains(search_query)
-        ]
-
-    filtered_df = filtered_df[filtered_df['Year'] == selected_year]
-
-    # Render 3D Plotly Space Scene
-    if len(filtered_df) == 0:
-        st.warning("⚠️ No celestial objects match your search criteria. Try a broader search term.")
-        fig = create_space_scene(title=f"SPHEREx Sky Map ({selected_year}) - Empty")
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.markdown(f"Displaying **{len(filtered_df)}** celestial sources for year **{selected_year}**.")
-        
-        fig = create_space_scene(title=f"SPHEREx 3D Cosmic Map ({selected_year})")
-
-        fig.add_trace(go.Scatter3d(
-            x=filtered_df['cart_x'],
-            y=filtered_df['cart_y'],
-            z=filtered_df['cart_z'],
-            mode="markers",
-            name="Cosmic Targets",
-            text=filtered_df['ObjectName'],
-            hovertemplate=(
-                "<b>%{text}</b><br>"
-                "Type: %{customdata[0]}<br>"
-                "RA: %{customdata[1]:.3f}°<br>"
-                "Dec: %{customdata[2]:.3f}°<br>"
-                "Infrared Flux: %{customdata[3]:.2f} MJy/sr<br>"
-                "Year: %{customdata[4]}<extra></extra>"
-            ),
-            customdata=np.stack((
-                filtered_df['ObjectType'].values,
-                filtered_df['RA'].values,
-                filtered_df['DEC'].values,
-                filtered_df['IR_Flux'].values,
-                filtered_df['Year'].values
-            ), axis=-1),
-            marker=dict(
-                size=5.5,
-                color=filtered_df['IR_Flux'],
-                colorscale="Inferno",
-                colorbar=dict(title="IR Flux (MJy/sr)", x=0.92),
-                opacity=0.95
-            )
-        ))
-
-        st.plotly_chart(fig, use_container_width=True)
-
-    # Optional Live IRSA FITS Section
-    if query_archive_btn:
-        with st.spinner("Querying official IRSA SPHEREx SIA collections..."):
-            products = query_spherex_products(archive_ra, archive_dec, radius_deg=0.1)
-            st.session_state["spherex_products"] = products
-
-    if "spherex_products" in st.session_state:
-        products = st.session_state["spherex_products"]
-        if products:
-            st.success(f"IRSA found {len(products)} actual SPHEREx product(s) near RA {archive_ra}, Dec {archive_dec}.")
-            rows, labels, url_map = [], [], {}
-            for index, record in enumerate(products, 1):
-                name = _value(record, "obs_id", "obs_publisher_did", "obs_title", "filename") or f"Product {index}"
-                url = _value(record, "access_url", "access_reference", "accessurl")
-                rows.append({
-                    "#": index,
-                    "Collection": record.get("_collection", ""),
-                    "Product": name,
-                    "Type": _value(record, "dataproduct_type"),
-                })
-                if url.startswith("https://"):
-                    label = f"{index}: {name[:90]}"
-                    labels.append(label)
-                    url_map[label] = url
-            st.dataframe(rows, use_container_width=True, hide_index=True)
-            if labels:
-                selected = st.selectbox("Select a real SPHEREx FITS product to inspect", labels)
-                if st.button("Display selected FITS product with Inferno"):
-                    try:
-                        with st.spinner("Downloading FITS data..."):
-                            planes = _fits_planes(download_fits(url_map[selected]))
-                        if planes:
-                            plane = planes[0]
-                            image = plane["data"]
-                            fig_fits = go.Figure(go.Heatmap(
-                                z=image[::2, ::2],
-                                colorscale="Inferno",
-                                colorbar={"title": plane["unit"]}
-                            ))
-                            fig_fits.update_layout(title="SPHEREx FITS Preview", paper_bgcolor="black", font_color="white")
-                            st.plotly_chart(fig_fits, use_container_width=True)
-                    except Exception as e:
-                        st.error(f"Failed to load FITS: {e}")
+    if submitted or "spherex_products" not in st.session_state:
+        if not target.strip():
+            st.error("Enter a target name or JPL Horizons ID.")
         else:
-            st.info("No archive products found at this specific coordinate radius.")
+            try:
+                with st.spinner("Resolving target coordinates from JPL Horizons…"):
+                    ra_deg, dec_deg = _radec_from_horizons(target.strip(), obs_date)
+                st.session_state["last_target"] = {
+                    "name": target.strip(),
+                    "date": obs_date,
+                    "ra": ra_deg,
+                    "dec": dec_deg,
+                }
+                with st.spinner("Searching official IRSA SPHEREx SIA collections…"):
+                    products = query_spherex_products(ra_deg, dec_deg, float(radius))
+                st.session_state["spherex_products"] = products
+            except Exception as exc:
+                # Fallback coordinates if Horizons offline
+                ra_deg, dec_deg = 304.6935, 42.4436
+                st.session_state["last_target"] = {"name": target.strip(), "date": obs_date, "ra": ra_deg, "dec": dec_deg}
+                st.session_state["spherex_products"] = []
+                st.warning(f"Horizons lookup note: {exc}. Using default fallback coordinates.")
+
+    if "last_target" in st.session_state:
+        t_info = st.session_state["last_target"]
+        st.write(f"**{t_info['name']}** ({t_info['date']}): RA `{t_info['ra']:.6f}°`, Dec `{t_info['dec']:.6f}°`")
+        products = st.session_state.get("spherex_products", [])
+        _show_products(products, t_info["name"], t_info["ra"], t_info["dec"], selected_year)
+
+    st.markdown("Sources: [JPL Horizons](https://ssd.jpl.nasa.gov/api/horizons.api.html) · [IRSA SPHEREx](https://irsa.ipac.caltech.edu/Missions/spherex.html) · [IRSA SIA documentation](https://irsa.ipac.caltech.edu/ibe/sia.html)")
 
 
 if __name__ == "__main__":
