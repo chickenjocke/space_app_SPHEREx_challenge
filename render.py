@@ -2,7 +2,7 @@
 import http.client
 import time
 import urllib.error
-from astropy.io import fits if False object
+from astropy.io import fits
 # modules used in 3d renderer
 import numpy as np
 import pandas as pd
@@ -85,23 +85,22 @@ def create_space_scene(title="3D Space Renderer", num_bg_stars=400, bg_radius=50
    )
    return fig
 
+# --- AI-ASSISTED CODE START: Fixed syntax and restored data loader function ---
 @st.cache_data
-def try_skycoord(ra_deg, dec_deg):
+def load_and_prep_nasa_data(ra_deg, dec_deg):
     df = None
     try:
         coord = SkyCoord(ra_deg, dec_deg, unit="deg")
         search_radius = 1 * u.arcsec
-        results = Irsa.query_sia(pos=coord, search_radius), collection=['spherex_dr1', 'spherex_qr3])
+        results = Irsa.query_sia(pos=(coord, search_radius), collection=['spherex_dr1', 'spherex_qr3'])
         if len(results) > 0:
-            df = results.to_table().to_pandas()
             df = results.to_table().to_pandas()
             df['RA'] = df['s_ra']
             df['DEC'] = df['s_dec']
             df['IR_Flux'] = df['em_min'].fillna(1.5)
     except Exception:
         pass
-    return
-def find_seed(ra_deg, dec_deg, df):
+
     if df is None or len(df) == 0:
         np.random.seed(101)
         n_points = 300
@@ -123,16 +122,14 @@ def find_seed(ra_deg, dec_deg, df):
         if 'IR_Flux' not in df.columns:
             df['IR_Flux'] = df.get('em_min', 2.0)
 
-    # Assign custom names for searching
     df['ObjectName'] = [f"{row['ObjectType']}-{i+1}" for i, row in df.iterrows()]
     return df
+# --- AI-ASSISTED CODE END ---
 
 st.sidebar.title("SPHEREx Search Bar")
 st.sidebar.markdown("Filter targets and look through timeline to see how it changes throughout time")
 target_ra = st.sidebar.number_input("Target RA (°)", value=304.6935)
 target_dec = st.sidebar.number_input("Target Dec (°)", value=42.4436)
-
-# start assisted code
 
 df = load_and_prep_nasa_data(target_ra, target_dec)
 
@@ -145,7 +142,7 @@ selected_year = st.sidebar.slider("Observation Year (Time Evolution)", int(min(y
 filtered_df = df[df['ObjectType'].isin(selected_types)]
 if search_query:
     filtered_df = filtered_df[filtered_df['ObjectName'].str.lower().str.contains(search_query)]
-    if filtered_df[filtered_df['ObjectName'].str.lower().str.contains('deino')]:
+    if filtered_df['ObjectName'].str.lower().str.contains('deino').any():
         for i in range(5):
             print("Deino")
         print("GUSTOPHER")
@@ -195,86 +192,3 @@ fig.add_trace(go.Scatter3d(
 ))
 
 st.plotly_chart(fig, use_container_width=True)
-# end assisted code
-                                                                        
-def render_spherex_live_nasa(fig, ra_deg=304.6935, dec_deg=42.4436, max_rows=25000):
-    # --- AI-ASSISTED CODE START ---
-    df = None
-    try:
-        coord = SkyCoord(ra_deg, dec_deg, unit="deg")
-        search_radius = 1 * u.arcsec
-        print(f"Sending HTTPS request to NASA IRSA for values: RA, {ra_deg}, Dec: {dec_deg}...")
-        results = Irsa.query_sia(pos=(coord, search_radius), collection = ['spherex_dr1', 'spherex_qr3'])
-        if len(results) > 0:
-            df = results.to_table().to_pandas().head(max_rows)
-            ra_col, dec_col = 's_ra', 's_dec'
-            df['Z'] = df['em_min'].fillna(1.0) / 5.0
-    except Exception as e:
-        print(f"Live NASA query failed ({e}). Falling back to local backup data...")
-
-    if df is None or len(df) == 0:
-        try:
-            df = pd.read_csv("spherex_data.csv").head(max_rows)
-            ra_col, dec_col = 'RA', 'DEC'
-            if 'Z' not in df.columns:
-                df['Z'] = 1.0
-            if 'em_min' not in df.columns:
-                df['em_min'] = 1.5
-        except Exception:
-            df = pd.DataFrame({
-                's_ra': [304.69, 304.70, 304.68],
-                's_dec': [42.44, 42.45, 42.43],
-                'em_min': [1.2, 2.5, 3.1],
-                'Z': [1.0, 1.2, 0.9]
-            })
-            ra_col, dec_col = 's_ra', 's_dec'
-    # --- AI-ASSISTED CODE END ---
-
-    distances = cosmo.comoving_distance(df['Z'].values)
-
-    coords = SkyCoord(
-        ra=df[ra_col].values * u.deg,
-        dec=df[dec_col].values * u.deg,
-        distance=distances
-    )
-
-    color_values = df.get('em_min', df.get('Z'))
-    color_label = "Infrared Wavelength (um)"
-
-    fig.add_trace(go.Scatter3d(
-        x=coords.cartesian.x.value,
-        y=coords.cartesian.y.value,
-        z=coords.cartesian.z.value,
-        mode="markers",
-        name="NASA SPHEREx Data",
-        hovertemplate=(
-            f"<b>SPHEREx IR Source</b><br>"
-            f"RA: %{{customdata[0]:.3f}}°<br>"
-            f"Dec: %{{customdata[1]:.3f}}°<br>"
-            f"{color_label}: %{{customdata[2]:.3f}} µm<extra></extra>"
-        ),
-        customdata=np.stack((df[ra_col].values, df[dec_col].values, color_values.values), axis=-1),
-        marker=dict(
-            size=3.0,
-            color=color_values,
-            colorscale="Inferno",
-            colorbar=dict(title=color_label, x=0.92),
-            opacity=0.9
-        )
-    ))
-    return fig
-
-
-if __name__ == "__main__":
-   fig = create_space_scene(title="SPHEREx Live 3D Infrared Sky Map", bg_radius=5000)
-   
-   fig = render_spherex_live_nasa(fig, ra_deg=304.6935, dec_deg=42.4436)
-   
-   try:
-       import streamlit as st
-       st.set_page_config(page_title="SPHEREx 3D Infrared Sky Map", layout="wide")
-       st.title("NASA SPHEREx 3D Time-Evolving Infrared Sky Map")
-       st.markdown("Interactive 3D visualization mapping real-time NASA IRSA infrared spectral data.")
-       st.plotly_chart(fig, use_container_width=True)
-   except Exception:
-       fig.show()
