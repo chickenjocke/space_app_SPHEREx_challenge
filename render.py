@@ -12,14 +12,11 @@ from astropy.coordinates import SkyCoord
 from astropy.cosmology import Planck18 as cosmo
 import astropy.units as u
 
-
-
 """ 
   BOILERPLATE CODE TO RENDER PLANETS(CREATED AS A BOILERPLATE BEFOREHAND;
   DOES NOT RENDER REAL PLANETS OR USE NASA DATA, ONLY TO SHOW PLANETS!
   AI USED IN CREATION OF SECTION TO CORRECTLY DESIGN PLANETS
 """
-
 
 def create_space_scene(title="3D Space Renderer", num_bg_stars=400, bg_radius=5000):
    fig = go.Figure()
@@ -29,11 +26,9 @@ def create_space_scene(title="3D Space Renderer", num_bg_stars=400, bg_radius=50
    theta = np.arccos(costheta)
    r = np.random.uniform(bg_radius * 0.7, bg_radius, num_bg_stars)
 
-
    bg_x = r * np.sin(theta) * np.cos(phi)
    bg_y = r * np.sin(theta) * np.sin(phi)
    bg_z = r * np.cos(theta)
-
 
    # Outer glow layer
    fig.add_trace(go.Scatter3d(
@@ -50,7 +45,6 @@ def create_space_scene(title="3D Space Renderer", num_bg_stars=400, bg_radius=50
        )
    ))
 
-
    fig.add_trace(go.Scatter3d(
        x=bg_x,
        y=bg_y,
@@ -66,7 +60,6 @@ def create_space_scene(title="3D Space Renderer", num_bg_stars=400, bg_radius=50
        )
    ))
 
-
    no_axis = dict(
        showbackground=False,
        showgrid=False,
@@ -74,7 +67,6 @@ def create_space_scene(title="3D Space Renderer", num_bg_stars=400, bg_radius=50
        showticklabels=False,
        title=""
    )
-
 
    fig.update_layout(
        title=title,
@@ -92,32 +84,29 @@ def create_space_scene(title="3D Space Renderer", num_bg_stars=400, bg_radius=50
    return fig
 
 
-
-
 def render_spherex_table(fig, filepath, ra_col="RA", dec_col="DEC", z_col="Z", ir_col=None, max_rows=25000):
    if filepath.endswith((".fits", ".fit")):
+       max_retries = 3
+       df = None
+       for attempt in range(max_retries):
+           try:
+               with fits.open(filepath, memmap=False) as hdulist:
+                   # Tries extension 1 first, falls back to 0 if needed
+                   ext_idx = 1 if len(hdulist) > 1 else 0
+                   df = Table(hdulist[ext_idx].data).to_pandas()
+               break
+           except (TimeoutError, urllib.error.HTTPError, http.client.IncompleteRead):
+               if attempt == max_retries - 1:
+                   raise
+               time.sleep(10 * (attempt + 1))
        
-        max_retries = 3
-        spectral_image_url = "YOUR_TARGET_SPHEREx_FITS_URL" # ADD FUNCTION HERE!
-        
-        for attempt in range(max_retries):
-            try:
-                with fits.open(spectral_image_url, memmap=False) as hdulist:
-                    df = Table(hdulist[1].data).to_pandas()
-                break
-            except (TimeoutError, urllib.error.HTTPError, http.client.IncompleteRead):
-                if attempt == max_retries - 1:
-                    raise
-                time.sleep(10 * (attempt + 1)) 
-          if df is None:
-            df = Table.read(filepath).to_pandas()
-        else:
-          df = pd.read_csv(filepath)
+       if df is None:
+           df = Table.read(filepath).to_pandas()
+   else:
+       df = pd.read_csv(filepath)
 
-    
    cols = [ra_col, dec_col, z_col] + ([ir_col] if ir_col else [])
    df = df[cols].dropna().head(max_rows)
-
 
    distances = cosmo.comoving_distance(df[z_col].values)
    coords = SkyCoord(
@@ -126,10 +115,8 @@ def render_spherex_table(fig, filepath, ra_col="RA", dec_col="DEC", z_col="Z", i
        distance=distances
    )
 
-
    color_values = df[ir_col] if ir_col else df[z_col]
    color_label = ir_col if ir_col else "Redshift (z)"
-
 
    fig.add_trace(go.Scatter3d(
        x=coords.cartesian.x.value,
@@ -139,11 +126,11 @@ def render_spherex_table(fig, filepath, ra_col="RA", dec_col="DEC", z_col="Z", i
        name="SPHEREx Infrared Sources",
        hovertemplate=(
            f"<b>SPHEREx Object</b><br>"
-           f"RA: %{{customdata:.3f}}°<br>"
-           f"Dec: %{{customdata:.3f}}°<br>"
-           f"{color_label}: %{{customdata:.3f}}<extra></extra>"
+           f"RA: %{{customdata[0]:.3f}}°<br>"
+           f"Dec: %{{customdata[1]:.3f}}°<br>"
+           f"{color_label}: %{{customdata[2]:.3f}}<extra></extra>"
        ),
-       customdata=df[[ra_col, dec_col]].assign(val=color_values).values,
+       customdata=np.stack((df[ra_col].values, df[dec_col].values, color_values.values), axis=-1),
        marker=dict(
            size=2.5,
            color=color_values,
@@ -166,5 +153,3 @@ if __name__ == "__main__":
        ir_col="FLUX_BAND_1"
    )
    fig.show()
-
-
