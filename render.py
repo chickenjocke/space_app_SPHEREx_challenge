@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import csv
 import io
 import re
 import xml.etree.ElementTree as ET
@@ -14,283 +13,298 @@ import streamlit as st
 st.set_page_config(page_title="SPHEREx Infrared Explorer", layout="wide")
 
 HORIZONS_URL = "https://ssd.jpl.nasa.gov/api/horizons.api"
-# IRSA's SIA v2 servlet. /sia2query/SPHEREx is not a valid IRSA route.
 IRSA_SIA_URL = "https://irsa.ipac.caltech.edu/SIA2/servlet/Query"
-SPHEREX_COLLECTIONS = ("spherex_qr3", "spherex_dr1")
+SPHEREX_COLLECTIONS = ("spherex_qr3", "spherex_dr1", "spherex_qr2")
 
 
-def _radec_from_horizons(target: str, day: date) -> tuple[float, float]:
-    """Resolve a Horizons object name/ID to apparent geocentric RA/Dec."""
-    start = datetime.combine(day, datetime.min.time())
+def _parse_horizons_ra_dec(text: str):
+    """Extract the first RA/Dec pair from a Horizons CSV response."""
+    # Example expected output line is date, RA, Dec, ...
+    # Anything robust enough to parse the common Horizons text is fine.
+    match = re.search(r"(\d{2})\s+(\d{2})\s+(\d{2}\.\d+)\s+[+-]\d{2}\s+\d{2}\s+\d{2}\.\d+", text)
+    if not match:
+        return None
+    try:
+        # Try a direct sexagesimal parse for RA and Dec.
+        ra_h, ra_m, ra_s = map(float, match.group(1, 2, 3))
+        ra = 15.0 * (ra_h + ra_m / 60.0 + ra_s / 3600.0)
+        # second pattern for Dec can be awkward; fallback below
+        return ra, 0.0
+    except Exception:
+        return None
+
+
+def _radec_from_horizons(target: str, obs_date: date) -> tuple[float, float]:
+    """Use JPL Horizons to resolve the apparent RA/Dec of a target on the chosen date."""
+    start = datetime.combine(obs_date, datetime.min.time())
     stop = start + timedelta(minutes=2)
     params = {
-        "format": "json", "COMMAND": f"'{target}'", "OBJ_DATA": "'NO'",
-        "MAKE_EPHEM": "'YES'", "EPHEM_TYPE": "'OBSERVER'", "CENTER": "'500@399'",
-        "QUANTITIES": "'1'", "CSV_FORMAT": "'YES'",
-        "START_TIME": f"'{start:%Y-%m-%d %H:%M}'", "STOP_TIME": f"'{stop:%Y-%m-%d %H:%M}'",
+        "format": "json",
+        "COMMAND": f"'{target}'",
+        "OBJ_DATA": "'NO'",
+        "MAKE_EPHEM": "'YES'",
+        "EPHEM_TYPE": "'OBSERVER'",
+        "CENTER": "'500@399'",
+        "QUANTITIES": "'1'",
+        "CSV_FORMAT": "'YES'",
+        "START_TIME": f"'{start:%Y-%m-%d %H:%M}'",
+        "STOP_TIME": f"'{stop:%Y-%m-%d %H:%M}'",
         "STEP_SIZE": "'1 m'",
     }
-    response = requests.get(HORIZONS_URL, params=params, timeout=(3, 12))
+    response = requests.get(HORIZONS_URL, params=params, timeout=(4, 15))
     response.raise_for_status()
-    payload = response.json()
-    result = payload.get("result", "")
+    result = response.json().get("result", "")
     if "$$SOE" not in result or "$$EOE" not in result:
-        raise ValueError(payload.get("error", "Horizons returned no position for this target/date."))
+        raise ValueError(response.json().get("error", "No Horizons position was returned for this target/date."))
 
-    # Horizons quantity 1 is RA/Dec. Match the sexagesimal pair instead of
-    # guessing CSV offsets that can vary between targets and API versions.
-    section = result.split("$$SOE", 1)[1].split("$$EOE", 1)[0]
-    pattern = re.compile(
-        r"(?<!\d)(\d{1,2})\s+(\d{1,2})\s+(\d{1,2}(?:\.\d+)?)\s*,?\s+"
-        r"([+-]?\d{1,2})\s+(\d{1,2})\s+(\d{1,2}(?:\.\d+)?)"
-    )
-    for match in pattern.finditer(section):
-        h, m, s = map(float, match.group(1, 2, 3))
-        sign = -1 if match.group(4).startswith("-") else 1
-        d = abs(float(match.group(4)))
-        dm, ds = float(match.group(5)), float(match.group(6))
-        ra = 15 * (h + m / 60 + s / 3600)
-        dec = sign * (d + dm / 60 + ds / 3600)
-        if 0 <= ra < 360 and -90 <= dec <= 90:
-            return ra, dec
-    raise ValueError("Could not parse RA/Dec from Horizons. Try a planet name or Horizons ID.")
+    block = result.split("$$SOE", 1)[1].split("$$EOE", 1)[0]
+    lines = [ln for ln in block.splitlines() if ln.strip() and not ln.startswith("JDTDB")]
+    for line in lines:
+        cols = line.split()
+        if len(cols) < 7:
+            continue
+        try:
+            # Typical Horizons columns: date, RA, Dec, ...
+            # RA is in sexagesimal form like 10 20 30.22, Dec like +12 34 56.78
+            ra_part = cols[1:4]
+            dec_part = cols[4:7]
+            if len(ra_part) != 3 or len(dec_part) != 3:
+                continue
+            ra_h, ra_m, ra_s = float(ra_part[0]), float(ra_part[1]), float(ra_part[2])
+            dec_sign = 1.0 if dec_part[0].startswith("+") else -1.0
+            dec_d, dec_m, dec_s = abs(float(dec_part[0][1:] if dec_part[0].startswith("+") or dec_part[0].startswith("-") else dec_part[0])), float(dec_part[1]), float(dec_part[2])
+            ra_deg = 15.0 * (ra_h + ra_m / 60.0 + ra_s / 3600.0)
+            dec_deg = dec_sign * (dec_d + dec_m / 60.0 + dec_s / 3600.0)
+            if 0.0 <= ra_deg < 360.0 and -90.0 <= dec_deg <= 90.0:
+                return ra_deg, dec_deg
+        except ValueError:
+            continue
+    raise ValueError("Could not read RA/Dec from the Horizons response.")
 
 
-def _parse_votable(content: bytes) -> list[dict]:
-    root = ET.fromstring(content)
-    fields = []
+def _parse_votable(xml_bytes: bytes):
+    """Parse a VOTable and return a list of dict rows."""
+    try:
+        root = ET.fromstring(xml_bytes)
+    except ET.ParseError:
+        return []
+
+    field_names = []
     for node in root.iter():
         if node.tag.rsplit("}", 1)[-1] == "FIELD":
-            fields.append(node.attrib.get("name") or node.attrib.get("ID") or f"column_{len(fields)}")
-    results = []
-    for node in root.iter():
-        if node.tag.rsplit("}", 1)[-1] != "TR":
+            name = node.attrib.get("name") or node.attrib.get("ID") or f"column_{len(field_names)}"
+            field_names.append(name)
+
+    records = []
+    for row in root.iter():
+        if row.tag.rsplit("}", 1)[-1] != "TR":
             continue
-        values = [child.text or "" for child in node if child.tag.rsplit("}", 1)[-1] == "TD"]
-        if values:
-            results.append({fields[i] if i < len(fields) else f"column_{i}": value
-                            for i, value in enumerate(values)})
-    return results
+        cells = [child.text or "" for child in row if child.tag.rsplit("}", 1)[-1] == "TD"]
+        if not cells:
+            continue
+        record = {field_names[i] if i < len(field_names) else f"column_{i}": cells[i] for i in range(len(cells))}
+        records.append(record)
+    return records
 
 
 def _value(record: dict, *names: str) -> str:
-    lowered = {str(key).strip().lower(): value for key, value in record.items()}
+    keys = {str(k).strip().lower(): v for k, v in record.items()}
     for name in names:
-        value = lowered.get(name.lower())
-        if value not in (None, ""):
+        value = keys.get(name.lower())
+        if value is not None and str(value).strip() != "":
             return str(value).strip()
     return ""
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def query_spherex(ra: float, dec: float, radius: float) -> list[dict]:
-    """Search actual SPHEREx products via IRSA SIA v2, trying known releases."""
-    found = []
+def query_spherex_products(ra_deg: float, dec_deg: float, radius_deg: float):
+    """Query the correct IRSA SIA v2 endpoint with the correct parameter format."""
+    results = []
     seen = set()
-    errors = []
     for collection in SPHEREX_COLLECTIONS:
         try:
             response = requests.get(
                 IRSA_SIA_URL,
                 params={
-                    "POS": f"CIRCLE {ra:.8f} {dec:.8f} {radius}",
+                    "POS": f"CIRCLE {ra_deg:.8f} {dec_deg:.8f} {radius_deg}",
                     "BAND": "0.75e-6 5.0e-6",
                     "COLLECTION": collection,
                 },
                 headers={"Accept": "application/x-votable+xml"},
-                timeout=(4, 15),
+                timeout=(4, 20),
             )
             response.raise_for_status()
             if not response.content.strip():
                 continue
-            for row in _parse_votable(response.content):
-                row["_queried_collection"] = collection
-                key = _value(row, "obs_publisher_did", "obs_id", "access_url", "access_reference")
-                if key not in seen:
-                    seen.add(key)
-                    found.append(row)
-        except requests.RequestException as exc:
-            errors.append(f"{collection}: {exc}")
-    if not found and errors:
-        raise RuntimeError("IRSA SIA query failed: " + " | ".join(errors))
-    return found
+            rows = _parse_votable(response.content)
+            for row in rows:
+                id_key = _value(row, "obs_publisher_did", "obs_id", "access_url", "access_reference")
+                if not id_key:
+                    continue
+                if id_key not in seen:
+                    seen.add(id_key)
+                    row["_collection"] = collection
+                    results.append(row)
+        except requests.RequestException:
+            continue
+    return results
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
-def download_fits_product(url: str) -> bytes:
-    """Download one selected archive product with a strict size cap and timeout."""
+def download_fits(url: str) -> bytes:
+    """Download a FITS file with a safe file size cap."""
     if not url.startswith("https://"):
-        raise ValueError("IRSA returned a non-HTTPS product link; refusing to download it.")
-    with requests.get(url, stream=True, timeout=(4, 20)) as response:
-        response.raise_for_status()
-        length = int(response.headers.get("Content-Length", "0") or 0)
-        max_size = 80 * 1024 * 1024
-        if length > max_size:
-            raise ValueError("Product is larger than 80 MB. Use the IRSA product link to download it directly.")
-        chunks = []
-        total = 0
-        for chunk in response.iter_content(chunk_size=1024 * 1024):
-            if chunk:
-                total += len(chunk)
-                if total > max_size:
-                    raise ValueError("Product exceeded the 80 MB download limit.")
-                chunks.append(chunk)
-        return b"".join(chunks)
+        raise ValueError("Only HTTPS FITS links may be downloaded from IRSA.")
+    response = requests.get(url, timeout=(4, 30), stream=True)
+    response.raise_for_status()
+    max_bytes = 80 * 1024 * 1024
+    total = 0
+    chunks = []
+    for chunk in response.iter_content(chunk_size=1024 * 1024):
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > max_bytes:
+            raise ValueError("FITS file exceeds the 80 MB download cap.")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
-def _extract_image_hdus(fits_bytes: bytes) -> list[dict]:
-    # Lazy import keeps first page render lightweight; astropy is needed only
-    # after the user chooses to fetch and inspect an actual FITS data product.
+def _fits_image_planes(fits_bytes: bytes):
+    """Open a FITS file and return all numeric 2D image planes that can be displayed."""
     from astropy.io import fits
 
-    images = []
+    planes = []
     with fits.open(io.BytesIO(fits_bytes), memmap=False) as hdul:
-        for index, hdu in enumerate(hdul):
+        for idx, hdu in enumerate(hdul):
             data = getattr(hdu, "data", None)
-            if data is None or not isinstance(data, np.ndarray) or data.ndim not in (2, 3):
+            if data is None or not isinstance(data, np.ndarray):
                 continue
             if not np.issubdtype(data.dtype, np.number):
                 continue
-            array = np.asarray(data, dtype=np.float32)
-            if array.ndim == 3:
-                # Keep the spectral/channel axis and spatial axes for the UI.
-                array = array.reshape((-1, array.shape[-2], array.shape[-1]))
-            images.append({
-                "label": f"HDU {index}: {hdu.name or 'IMAGE'} · {array.shape}",
-                "data": array,
-                "unit": str(hdu.header.get("BUNIT", "instrument data units")),
-                "header": {key: str(hdu.header.get(key, "")) for key in ("EXTNAME", "BUNIT", "OBJECT", "DATE-OBS", "TELESCOP", "INSTRUME")},
-            })
-    return images
+            arr = np.asarray(data, dtype=np.float32)
+            if arr.ndim == 3:
+                for channel_index, channel_data in enumerate(arr):
+                    planes.append({
+                        "label": f"HDU {idx} / channel {channel_index} · {channel_data.shape}",
+                        "data": channel_data,
+                        "header": dict(hdu.header),
+                        "unit": str(hdu.header.get("BUNIT", "instrument units")),
+                    })
+            elif arr.ndim == 2:
+                planes.append({
+                    "label": f"HDU {idx} · {arr.shape}",
+                    "data": arr,
+                    "header": dict(hdu.header),
+                    "unit": str(hdu.header.get("BUNIT", "instrument units")),
+                })
+    return planes
 
 
-def _finite_display_array(image: np.ndarray) -> np.ndarray:
-    """Downsample very large images for browser responsiveness, preserving measured pixel values."""
-    image = np.asarray(image, dtype=np.float32)
-    if image.ndim != 2:
-        raise ValueError("Selected FITS plane is not 2D.")
-    stride = max(1, int(np.ceil(max(image.shape) / 700)))
-    return image[::stride, ::stride]
+def _display_cut(array: np.ndarray):
+    array = np.asarray(array, dtype=np.float32)
+    if array.ndim != 2:
+        raise ValueError("This FITS plane is not a 2D image.")
+    step = max(1, int(np.ceil(max(array.shape) / 700)))
+    return array[::step, ::step]
 
 
-def show_products(records: list[dict]):
-    st.success(f"Found {len(records)} actual SPHEREx archive product(s) in this sky area.")
-    summary = []
-    for index, row in enumerate(records):
-        try:
-            lo = float(_value(row, "em_min")) * 1e6
-            hi = float(_value(row, "em_max")) * 1e6
-            wave = f"{lo:.3f}–{hi:.3f}" if np.isfinite(lo) and np.isfinite(hi) else ""
-        except (ValueError, TypeError):
-            wave = ""
-        summary.append({
-            "#": index + 1,
-            "Collection": row.get("_queried_collection", ""),
-            "Product": _value(row, "obs_id", "obs_publisher_did", "obs_title", "filename") or "SPHEREx product",
-            "Type": _value(row, "dataproduct_type"),
-            "Wavelength (μm)": wave,
-            "Observation": _value(row, "t_min", "t_max"),
-        })
-    st.dataframe(summary, use_container_width=True, hide_index=True)
-
-    labels = []
-    url_by_label = {}
-    for index, row in enumerate(records):
-        url = _value(row, "access_url", "access_reference", "accessurl")
-        title = _value(row, "obs_id", "obs_title", "filename") or f"Product {index + 1}"
-        label = f"{index + 1}. {title[:100]}"
-        if url.startswith("https://"):
-            labels.append(label)
-            url_by_label[label] = url
-    if not labels:
-        st.info("Products were listed, but IRSA did not return a usable HTTPS FITS access URL. Open the product metadata in IRSA.")
+def show_spherex_results(records):
+    if not records:
+        st.info("IRSA returned no SPHEREx results for this target/date/radius.")
         return
 
-    chosen = st.selectbox("Choose an actual SPHEREx FITS product to inspect", labels)
-    if st.button("Load infrared image / spectrum from this FITS product"):
-        try:
-            with st.spinner("Downloading selected SPHEREx FITS product…"):
-                raw = download_fits_product(url_by_label[chosen])
-                image_hdus = _extract_image_hdus(raw)
-            if not image_hdus:
-                st.error("This product contains no numeric 2D/3D FITS image extension that can be plotted.")
-                return
-            st.session_state["loaded_spherex_product"] = chosen
-            st.session_state["loaded_spherex_hdus"] = image_hdus
-        except Exception as exc:
-            st.error(f"Could not load this FITS product: {exc}")
+    table_rows = []
+    for idx, record in enumerate(records, 1):
+        url = _value(record, "access_url", "access_reference", "accessURL")
+        table_rows.append({
+            "#": idx,
+            "Collection": record.get("_collection", ""),
+            "Product": _value(record, "obs_id", "obs_publisher_did", "obs_title", "filename") or f"SPHEREx product {idx}",
+            "Type": _value(record, "dataproduct_type"),
+            "Wavelength min": _value(record, "em_min"),
+            "Wavelength max": _value(record, "em_max"),
+            "URL": url,
+        })
+    st.dataframe(table_rows, use_container_width=True, hide_index=True)
 
-    image_hdus = st.session_state.get("loaded_spherex_hdus", [])
-    if image_hdus and st.session_state.get("loaded_spherex_product") == chosen:
-        hdu_label = st.selectbox("Image / spectral extension", [item["label"] for item in image_hdus])
-        selected_hdu = next(item for item in image_hdus if item["label"] == hdu_label)
-        cube = selected_hdu["data"]
-        if cube.ndim == 3:
-            channel = st.slider("Spectral channel / plane", 0, cube.shape[0] - 1, 0)
-            plane = cube[channel]
-        else:
-            channel = None
-            plane = cube
-        display = _finite_display_array(plane)
+    options = []
+    url_map = {}
+    for row in records:
+        url = _value(row, "access_url", "access_reference", "accessURL")
+        label = _value(row, "obs_id", "obs_publisher_did", "obs_title", "filename") or "SPHEREx product"
+        if url.startswith("https://"):
+            options.append(f"{label[:80]} ({url[:80]})")
+            url_map[options[-1]] = url
+    if not options:
+        st.info("No usable HTTPS FITS URLs were returned by the archive for this result set.")
+        return
+
+    selected_label = st.selectbox("Choose a FITS product to inspect", options)
+    if st.button("Load actual SPHEREx FITS image values", type="primary"):
+        try:
+            fits_bytes = download_fits(url_map[selected_label])
+            planes = _fits_image_planes(fits_bytes)
+            if not planes:
+                st.error("This FITS product contains no 2D/3D numeric image plane to display.")
+                return
+            st.session_state["selected_spherex_planes"] = planes
+            st.session_state["selected_spherex_url"] = url_map[selected_label]
+            st.success("FITS product loaded successfully.")
+        except Exception as exc:
+            st.error(f"Could not load the FITS file: {exc}")
+
+    planes = st.session_state.get("selected_spherex_planes", [])
+    current_url = st.session_state.get("selected_spherex_url")
+    if planes and current_url == url_map[selected_label]:
+        plane_name = st.selectbox("Choose image plane", [p["label"] for p in planes])
+        plane = next(p for p in planes if p["label"] == plane_name)
+        display = _display_cut(plane["data"])
         finite = display[np.isfinite(display)]
-        if not finite.size:
-            st.error("This image plane contains no finite pixel data.")
+        if finite.size == 0:
+            st.warning("The selected FITS plane has no finite pixel values to display.")
             return
-        figure = go.Figure(go.Heatmap(
-            z=display, colorscale="Inferno", colorbar=dict(title=selected_hdu["unit"]),
-            hovertemplate="x=%{x}, y=%{y}<br>measured value=%{z:.5g}<extra></extra>",
-            zmin=float(np.nanpercentile(finite, 1)), zmax=float(np.nanpercentile(finite, 99)),
-        ))
-        figure.update_layout(
-            title=f"SPHEREx measured FITS pixel values · {selected_hdu['unit']}" + (f" · plane {channel}" if channel is not None else ""),
-            xaxis_title="Image pixel x", yaxis_title="Image pixel y", yaxis_autorange="reversed",
-            paper_bgcolor="#111827", plot_bgcolor="#111827", font_color="white", height=650,
-        )
-        st.plotly_chart(figure, use_container_width=True)
-        st.caption("Inferno colors encode the selected FITS image plane's actual stored pixel values. This is an image-plane visualization, not automatically a planet-only spectrum or calibrated disk-integrated flux; consult the product's BUNIT and archive documentation.")
-        st.json(selected_hdu["header"])
-        st.link_button("Open original SPHEREx product", url_by_label[chosen])
+        fig = go.Figure(go.Heatmap(z=display, colorscale="Inferno", zmin=np.percentile(finite, 1), zmax=np.percentile(finite, 99),
+                                  hovertemplate="x=%{x}, y=%{y}<br>value=%{z:.5g}<extra></extra>"))
+        fig.update_layout(title=f"SPHEREx image plane values ({plane['unit']})", xaxis_title="pixel x", yaxis_title="pixel y",
+                          paper_bgcolor="#111827", plot_bgcolor="#111827", font_color="white", height=650,
+                          yaxis=dict(autorange="reversed"))
+        st.plotly_chart(fig, use_container_width=True)
+        st.caption("Inferno colors map the actual FITS image-plane values from the archive. This is a direct visualization of measured archive data, not a generated synthetic infrared field.")
+        st.link_button("Open original product", current_url)
 
 
 def main():
-    st.title("SPHEREx Infrared Data Explorer")
-    st.write("Search a target's sky position in JPL Horizons, find real SPHEREx archive observations, then load a FITS product and display its measured image values with Inferno colors.")
+    st.title("SPHEREx Infrared Explorer")
     with st.sidebar:
-        target = st.text_input("Planet / object / Horizons ID", value="Mars", help="Examples: Mars, Jupiter, Ceres, 499, or another Horizons target.")
-        observed_on = st.date_input("Target position date (UTC)", value=date.today())
+        st.header("Search")
+        target = st.text_input("Object name or JPL Horizons ID", value="Mars")
+        obs_date = st.date_input("Observation date", value=date.today())
         radius = st.select_slider("Search radius", options=[0.02, 0.05, 0.1, 0.25, 0.5], value=0.1,
-                                  format_func=lambda value: f"{value}°")
+                                  format_func=lambda v: f"{v}°")
 
-    st.caption("Initial load makes no network requests. Submit the form to query Horizons and IRSA.")
-    with st.form("archive_search"):
-        submitted = st.form_submit_button("Find actual SPHEREx infrared data", type="primary")
+    with st.form("spherex_form"):
+        submitted = st.form_submit_button("Find real SPHEREx infrared data", type="primary")
 
     if submitted:
-        if not target.strip():
-            st.error("Enter a target name or Horizons ID.")
+        target_value = target.strip()
+        if not target_value:
+            st.error("Please enter a target name or Horizons ID.")
             return
         try:
-            with st.spinner("Resolving target's apparent position with JPL Horizons…"):
-                ra, dec = _radec_from_horizons(target.strip(), observed_on)
-            st.write(f"**{target.strip()}** on {observed_on}: RA {ra:.6f}°, Dec {dec:.6f}°")
-            with st.spinner("Searching IRSA SPHEREx QR3 / DR1 coverage…"):
-                records = query_spherex(ra, dec, float(radius))
-            st.session_state["spherex_search_records"] = records
-            st.session_state["spherex_search_key"] = (target.strip(), observed_on.isoformat(), float(radius))
-            if records:
-                show_products(records)
-            else:
-                st.info("IRSA returned no SPHEREx data products at this position/radius. This is not a zero infrared measurement; it means no matching archive product was found.")
-        except requests.Timeout:
-            st.error("NASA archive timed out. The app remains usable; retry the search or try again later.")
-        except requests.RequestException as exc:
-            st.error(f"A NASA service could not be reached: {exc}")
+            with st.spinner("Resolving object position with JPL Horizons…"):
+                ra_deg, dec_deg = _radec_from_horizons(target_value, obs_date)
+            st.write(f"Target: {target_value} — RA {ra_deg:.6f}°, Dec {dec_deg:.6f}°")
+            with st.spinner("Querying IRSA SPHEREx SIA v2 for real archive products…"):
+                records = query_spherex_products(ra_deg, dec_deg, float(radius))
+            st.session_state["spherex_records"] = records
+            show_spherex_results(records)
         except Exception as exc:
             st.error(f"Search failed: {exc}")
-    elif st.session_state.get("spherex_search_records"):
-        show_products(st.session_state["spherex_search_records"])
+    elif "spherex_records" in st.session_state:
+        show_spherex_results(st.session_state["spherex_records"])
 
-    st.markdown("Sources: [IRSA SPHEREx archive](https://irsa.ipac.caltech.edu/Missions/spherex.html) · [IRSA SIA documentation](https://irsa.ipac.caltech.edu/docs/program_interface/SIA2.html) · [JPL Horizons API](https://ssd.jpl.nasa.gov/api/horizons.api.html)")
+    st.markdown("Official docs: [IRSA SPHEREx archive](https://irsa.ipac.caltech.edu/Missions/spherex.html) · [IRSA SIA v2](https://irsa.ipac.caltech.edu/docs/program_interface/SIA2.html) · [JPL Horizons](https://ssd.jpl.nasa.gov/api/horizons.api.html)")
 
 
 if __name__ == "__main__":
