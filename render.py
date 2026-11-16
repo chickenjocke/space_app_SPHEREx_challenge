@@ -39,6 +39,24 @@ def _query_spherex(coord, search_radius_deg=1.0):
     return None
 
 
+def _numeric_series(values, index):
+    """Return numeric data as an index-aligned Series, even for scalar or array inputs."""
+    if isinstance(values, pd.Series):
+        series = values.copy()
+    else:
+        series = pd.Series(values, index=index)
+    return pd.to_numeric(series, errors="coerce")
+
+
+def _fill_missing_redshifts(values, index):
+    """Fill invalid/missing redshifts with randomized fallback values."""
+    redshifts = _numeric_series(values, index)
+    missing = redshifts.isna()
+    if missing.any():
+        redshifts.loc[missing] = np.random.uniform(0.1, 2.0, int(missing.sum()))
+    return redshifts
+
+
 def create_space_scene(title="3D Space Renderer", num_bg_stars=600, bg_radius=8000):
     fig = go.Figure()
     np.random.seed(42)
@@ -113,24 +131,26 @@ def load_and_prep_nasa_data(ra_deg, dec_deg):
         if "DEC" not in df.columns:
             df["DEC"] = df.get("s_dec", df.get("dec", np.nan))
         if "IR_Flux" not in df.columns:
-            flux_series = pd.to_numeric(df.get("em_min", pd.Series(np.nan, index=df.index)), errors="coerce")
-            df["IR_Flux"] = flux_series.fillna(1.5)
+            flux_values = _numeric_series(df.get("em_min", pd.Series(np.nan, index=df.index)), df.index)
+            df["IR_Flux"] = flux_values.fillna(1.5)
         if "Z" not in df.columns:
-            df["Z"] = pd.to_numeric(df.get("z", pd.Series(np.nan, index=df.index)), errors="coerce").fillna(np.random.uniform(0.1, 2.0, len(df)))
+            df["Z"] = np.random.uniform(0.1, 2.0, len(df))
+        else:
+            df["Z"] = _fill_missing_redshifts(df["Z"], df.index)
         if "Year" not in df.columns:
             df["Year"] = np.random.choice([2025, 2026, 2027], len(df))
         else:
-            df["Year"] = pd.to_numeric(df["Year"], errors="coerce").fillna(2025).astype(int)
+            df["Year"] = _numeric_series(df["Year"], df.index).fillna(2025).astype(int)
         if "ObjectType" not in df.columns:
             df["ObjectType"] = np.random.choice(["Planet", "Star", "Galaxy"], len(df), p=[0.15, 0.45, 0.40])
 
     df = df.copy()
-    df["RA"] = pd.to_numeric(df.get("RA", np.nan), errors="coerce").fillna(0.0)
-    df["DEC"] = pd.to_numeric(df.get("DEC", np.nan), errors="coerce").fillna(0.0)
-    df["IR_Flux"] = pd.to_numeric(df.get("IR_Flux", 1.5), errors="coerce").fillna(1.5)
-    df["Z"] = pd.to_numeric(df.get("Z", np.nan), errors="coerce").fillna(np.random.uniform(0.1, 2.0, len(df)))
-    df["Year"] = pd.to_numeric(df.get("Year", 2025), errors="coerce").fillna(2025).astype(int)
-    df["ObjectType"] = df.get("ObjectType", pd.Series(["Star"] * len(df), index=df.index)).astype(str).fillna("Star")
+    for column, default in (("RA", 0.0), ("DEC", 0.0), ("IR_Flux", 1.5)):
+        values = _numeric_series(df.get(column, default), df.index)
+        df[column] = values.fillna(default)
+    df["Z"] = _fill_missing_redshifts(df.get("Z", pd.Series(np.nan, index=df.index)), df.index)
+    df["Year"] = _numeric_series(df.get("Year", 2025), df.index).fillna(2025).astype(int)
+    df["ObjectType"] = df.get("ObjectType", pd.Series(["Star"] * len(df), index=df.index)).fillna("Star").astype(str)
     df["ObjectName"] = [f"{row['ObjectType']}-{i + 1}" for i, row in df.iterrows()]
     return df
 
@@ -142,12 +162,16 @@ def render_spherex_live_nasa(fig, ra_deg=304.6935, dec_deg=42.4436, max_rows=250
         results = _query_spherex(coord, 1.0)
         if results is not None and len(results) > 0:
             df = results.to_table().to_pandas().head(max_rows)
-            ra_col, dec_col = "s_ra", "s_dec"
-            if ra_col not in df.columns:
+            if "s_ra" in df.columns:
+                ra_col = "s_ra"
+            else:
                 ra_col = "RA" if "RA" in df.columns else "ra"
-            if dec_col not in df.columns:
+            if "s_dec" in df.columns:
+                dec_col = "s_dec"
+            else:
                 dec_col = "DEC" if "DEC" in df.columns else "dec"
-            df["Z"] = pd.to_numeric(df.get("em_min", df.get("Z", 1.0)), errors="coerce").fillna(1.0) / 5.0
+            redshift_source = df.get("em_min", df.get("Z", pd.Series(1.0, index=df.index)))
+            df["Z"] = _numeric_series(redshift_source, df.index).fillna(1.0) / 5.0
     except Exception:
         df = None
 
@@ -158,14 +182,14 @@ def render_spherex_live_nasa(fig, ra_deg=304.6935, dec_deg=42.4436, max_rows=250
         ra_col = "RA" if "RA" in df.columns else ("s_ra" if "s_ra" in df.columns else "ra")
         dec_col = "DEC" if "DEC" in df.columns else ("s_dec" if "s_dec" in df.columns else "dec")
 
-    distances = cosmo.comoving_distance(df["Z"].fillna(1.0).to_numpy())
+    distances = cosmo.comoving_distance(_numeric_series(df["Z"], df.index).fillna(1.0).to_numpy())
     coords = SkyCoord(
-        ra=pd.to_numeric(df[ra_col], errors="coerce").fillna(0.0).to_numpy() * u.deg,
-        dec=pd.to_numeric(df[dec_col], errors="coerce").fillna(0.0).to_numpy() * u.deg,
+        ra=_numeric_series(df[ra_col], df.index).fillna(0.0).to_numpy() * u.deg,
+        dec=_numeric_series(df[dec_col], df.index).fillna(0.0).to_numpy() * u.deg,
         distance=distances,
     )
 
-    color_values = pd.to_numeric(df.get("em_min", df.get("IR_Flux", df.get("Z", 1.0))), errors="coerce").fillna(1.0)
+    color_values = _numeric_series(df.get("em_min", df.get("IR_Flux", df["Z"])), df.index).fillna(1.0)
     color_label = "Infrared Wavelength (um)"
 
     fig.add_trace(
