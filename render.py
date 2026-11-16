@@ -90,7 +90,7 @@ def render_spherex_live_nasa(fig, ra_deg=304.6935, dec_deg=42.4436, max_rows=250
     search_radius = 1 * u.arsec
     print(f"Sending HTTPS request to NASA IRSA for values: RA, {ra_deg}, Dec: {dec_deg}...")
     results = Irsa.query_sia(pos=(coord, search_radius), collection = ['spherex_dr1', 'spherex_qr3'])
-    if len(results) = 0:
+    if len(results) == 0:
         raise ValueError("No SPHEREx data found for these coordinates.")
       
     df = results.to_table().to_pandas().head(max_rows)
