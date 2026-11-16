@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import csv
 import io
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import re
+import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta
 
 import numpy as np
@@ -10,185 +11,255 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="Solar System Sky Map", layout="wide")
+st.set_page_config(page_title="SPHEREx Infrared Solar System Explorer", layout="wide")
 
 HORIZONS_URL = "https://ssd.jpl.nasa.gov/api/horizons.api"
-GAIA_URL = "https://gea.esac.esa.int/tap-server/tap/sync"
-
-# Approximate JPL secular orbital elements for 1800-2050. These are used only
-# for an immediate local preview; the app labels them as estimates, not live data.
-# name, Horizons ID, a(AU), e, inclination, mean longitude, longitude perihelion,
-# longitude ascending node, color, marker size
-PLANETS = [
-    ("Mercury", "199", .387099, .205636, 7.005, 252.251, 77.456, 48.331, "#b8b8b8", 4),
-    ("Venus", "299", .723332, .006772, 3.395, 181.980, 131.602, 76.680, "#f5c46b", 6),
-    ("Earth", "399", 1.000000, .016708, 0.000, 100.464, 102.937, 0.000, "#4da6ff", 7),
-    ("Mars", "499", 1.523679, .093400, 1.849, 355.453, 336.041, 49.558, "#ff7043", 5),
-    ("Jupiter", "599", 5.202600, .048498, 1.303, 34.404, 14.753, 100.464, "#e8b17a", 11),
-    ("Saturn", "699", 9.554910, .055508, 2.489, 49.944, 92.432, 113.665, "#f2dc8c", 9),
-    ("Uranus", "799", 19.218400, .046295, .773, 313.232, 170.964, 74.006, "#83e3e3", 8),
-    ("Neptune", "899", 30.110400, .008988, 1.770, 304.880, 44.971, 131.784, "#577dff", 8),
-]
+IRSA_SIA_URL = "https://irsa.ipac.caltech.edu/sia2query/SPHEREx"
+PLANET_IDS = {
+    "Mercury": "199", "Venus": "299", "Earth": "399", "Mars": "499",
+    "Jupiter": "599", "Saturn": "699", "Uranus": "799", "Neptune": "899",
+    "Sun": "10",
+}
 
 
-def _kepler_position(body, day_offset: float = 0.0) -> tuple[float, float, float]:
-    """Fast approximate heliocentric position, calculated locally with no network."""
-    name, _, a, eccentricity, inclination, mean_longitude, perihelion, node = body[:8]
-    periods_days = {
-        "Mercury": 87.969, "Venus": 224.701, "Earth": 365.256,
-        "Mars": 686.980, "Jupiter": 4332.59, "Saturn": 10759.2,
-        "Uranus": 30688.5, "Neptune": 60182.0,
-    }
-    mean_anomaly = np.radians((mean_longitude - perihelion) % 360)
-    mean_anomaly += 2 * np.pi * day_offset / periods_days[name]
-    mean_anomaly = (mean_anomaly + np.pi) % (2 * np.pi) - np.pi
-    eccentric_anomaly = mean_anomaly
-    for _ in range(6):
-        eccentric_anomaly -= (eccentric_anomaly - eccentricity * np.sin(eccentric_anomaly) - mean_anomaly) / (1 - eccentricity * np.cos(eccentric_anomaly))
-    x_orbit = a * (np.cos(eccentric_anomaly) - eccentricity)
-    y_orbit = a * np.sqrt(1 - eccentricity**2) * np.sin(eccentric_anomaly)
-    arg_perihelion = np.radians(perihelion - node)
-    inc, asc_node = np.radians(inclination), np.radians(node)
-    x = x_orbit * (np.cos(asc_node) * np.cos(arg_perihelion) - np.sin(asc_node) * np.sin(arg_perihelion) * np.cos(inc)) + y_orbit * (-np.cos(asc_node) * np.sin(arg_perihelion) - np.sin(asc_node) * np.cos(arg_perihelion) * np.cos(inc))
-    y = x_orbit * (np.sin(asc_node) * np.cos(arg_perihelion) + np.cos(asc_node) * np.sin(arg_perihelion) * np.cos(inc)) + y_orbit * (-np.sin(asc_node) * np.sin(arg_perihelion) + np.cos(asc_node) * np.cos(arg_perihelion) * np.cos(inc))
-    z = x_orbit * np.sin(arg_perihelion) * np.sin(inc) + y_orbit * np.cos(arg_perihelion) * np.sin(inc)
-    return float(x), float(y), float(z)
+def _sexagesimal_to_degrees(value: str, is_ra: bool) -> float:
+    """Convert Horizons sexagesimal RA/Dec (or decimal degrees) to degrees."""
+    value = value.strip()
+    parts = value.split()
+    if len(parts) == 1:
+        return float(parts[0])
+    sign = -1.0 if parts[0].startswith("-") else 1.0
+    first = abs(float(parts[0]))
+    result = first + float(parts[1]) / 60.0 + float(parts[2]) / 3600.0
+    if is_ra:
+        result *= 15.0
+    return sign * result
 
 
-def _horizons_vector(body_id: str, day: str) -> tuple[float, float, float]:
+def _horizons_apparent_radec(target: str, observed_on: date) -> tuple[float, float]:
+    """Resolve any Horizons target to its apparent geocentric RA/Dec for the selected date."""
+    start = datetime.combine(observed_on, datetime.min.time())
+    stop = start + timedelta(minutes=2)
     params = {
-        "format": "json", "COMMAND": f"'{body_id}'", "OBJ_DATA": "'NO'",
-        "MAKE_EPHEM": "'YES'", "EPHEM_TYPE": "'VECTORS'", "CENTER": "'500@10'",
-        "REF_PLANE": "'FRAME'", "VEC_TABLE": "'2'", "OUT_UNITS": "'AU-D'",
-        "CSV_FORMAT": "'YES'", "START_TIME": f"'{day} 00:00'",
-        "STOP_TIME": f"'{day} 00:01'", "STEP_SIZE": "'1 d'",
+        "format": "json", "COMMAND": f"'{target}'", "OBJ_DATA": "'NO'",
+        "MAKE_EPHEM": "'YES'", "EPHEM_TYPE": "'OBSERVER'", "CENTER": "'500@399'",
+        "QUANTITIES": "'1'", "CSV_FORMAT": "'YES'",
+        "START_TIME": f"'{start:%Y-%m-%d %H:%M}'", "STOP_TIME": f"'{stop:%Y-%m-%d %H:%M}'",
+        "STEP_SIZE": "'1 m'",
     }
-    response = requests.get(HORIZONS_URL, params=params, timeout=(2, 5))
+    response = requests.get(HORIZONS_URL, params=params, timeout=(3, 12))
     response.raise_for_status()
-    text = response.json().get("result", "")
-    if "$$SOE" not in text or "$$EOE" not in text:
-        raise ValueError("Horizons response contained no ephemeris data")
-    for row in csv.reader(io.StringIO(text.split("$$SOE", 1)[1].split("$$EOE", 1)[0].strip())):
-        if len(row) >= 5:
+    result = response.json().get("result", "")
+    if "$$SOE" not in result or "$$EOE" not in result:
+        raise ValueError(response.json().get("error", "Horizons returned no position for this target/date."))
+    rows = list(csv.reader(io.StringIO(result.split("$$SOE", 1)[1].split("$$EOE", 1)[0].strip())))
+    for row in rows:
+        # With QUANTITIES=1 Horizons emits date, blank, RA, Dec, followed by other columns.
+        for index in range(1, max(2, len(row) - 1)):
+            if index + 1 >= len(row):
+                break
             try:
-                return float(row[2]), float(row[3]), float(row[4])
-            except ValueError:
+                ra = _sexagesimal_to_degrees(row[index], is_ra=True)
+                dec = _sexagesimal_to_degrees(row[index + 1], is_ra=False)
+                if 0 <= ra < 360 and -90 <= dec <= 90:
+                    return ra, dec
+            except (ValueError, IndexError):
                 continue
-    raise ValueError("Could not parse Horizons vector")
+    raise ValueError("Could not read RA/Dec from the Horizons response. Try a planet name or Horizons ID.")
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def fetch_horizons_positions(day: str) -> tuple[dict, list[str]]:
-    positions, errors = {}, []
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = {pool.submit(_horizons_vector, body[1], day): body[0] for body in PLANETS}
-        for future in as_completed(futures):
-            name = futures[future]
-            try:
-                positions[name] = future.result()
-            except Exception as exc:
-                errors.append(f"{name}: {exc}")
-    return positions, errors
+def _parse_sia_votable(xml_bytes: bytes) -> list[dict]:
+    """Parse an IRSA SIA VOTable without adding a heavyweight astronomy dependency."""
+    root = ET.fromstring(xml_bytes)
+    fields = []
+    for element in root.iter():
+        if element.tag.rsplit("}", 1)[-1] == "FIELD":
+            fields.append(element.attrib.get("name") or element.attrib.get("ID") or f"column_{len(fields)}")
+    records = []
+    for element in root.iter():
+        if element.tag.rsplit("}", 1)[-1] != "TR":
+            continue
+        values = [child.text or "" for child in element if child.tag.rsplit("}", 1)[-1] == "TD"]
+        if values:
+            records.append({fields[i] if i < len(fields) else f"column_{i}": value
+                            for i, value in enumerate(values)})
+    return records
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_gaia_stars(limit: int) -> tuple[list[dict], str | None]:
-    query = (f"SELECT TOP {int(limit)} ra,dec,phot_g_mean_mag FROM gaiadr3.gaia_source "
-             "WHERE phot_g_mean_mag < 6.5 AND ra IS NOT NULL AND dec IS NOT NULL "
-             "ORDER BY phot_g_mean_mag ASC")
+def _column(record: dict, *names: str) -> str:
+    lookup = {str(key).lower(): value for key, value in record.items()}
+    for name in names:
+        value = lookup.get(name.lower())
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+def _float_field(record: dict, *names: str) -> float | None:
     try:
-        response = requests.get(GAIA_URL, params={"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "csv", "QUERY": query}, timeout=(2, 5))
-        response.raise_for_status()
-        rows = csv.DictReader(io.StringIO(response.text))
-        stars = [{"ra": float(r["ra"]), "dec": float(r["dec"]), "mag": float(r["phot_g_mean_mag"])}
-                 for r in rows if r.get("ra") and r.get("dec") and r.get("phot_g_mean_mag")]
-        return stars, None
-    except Exception as exc:
-        return [], str(exc)
+        value = float(_column(record, *names))
+        return value if np.isfinite(value) else None
+    except (TypeError, ValueError):
+        return None
 
 
-def make_figure(day: date, positions: dict, use_horizons: bool, selected: str,
-                trail_days: int, stars: list[dict]):
+@st.cache_data(ttl=1800, show_spinner=False)
+def query_spherex_at_position(ra: float, dec: float, radius_deg: float) -> list[dict]:
+    """Search actual SPHEREx spectral-image coverage around an apparent target position."""
+    response = requests.get(
+        IRSA_SIA_URL,
+        params={
+            "POS": f"CIRCLE {ra:.8f} {dec:.8f} {radius_deg}",
+            "BAND": "0.75e-6 5.0e-6",
+        },
+        headers={"Accept": "application/x-votable+xml"},
+        timeout=(4, 18),
+    )
+    response.raise_for_status()
+    if not response.content.strip():
+        return []
+    return _parse_sia_votable(response.content)
+
+
+def _local_preview_positions(day: date) -> dict:
+    """Fast approximate local orbit preview; never presented as archive/infrared data."""
+    # Compact circular-orbit preview keeps initial page rendering independent of network services.
+    periods = {"Mercury": 87.969, "Venus": 224.701, "Earth": 365.256,
+               "Mars": 686.980, "Jupiter": 4332.59, "Saturn": 10759.2,
+               "Uranus": 30688.5, "Neptune": 60182.0}
+    radii = {"Mercury": .387, "Venus": .723, "Earth": 1., "Mars": 1.524,
+             "Jupiter": 5.203, "Saturn": 9.555, "Uranus": 19.218, "Neptune": 30.11}
+    colors = {"Mercury": "#b8b8b8", "Venus": "#f5c46b", "Earth": "#4da6ff", "Mars": "#ff7043",
+              "Jupiter": "#e8b17a", "Saturn": "#f2dc8c", "Uranus": "#83e3e3", "Neptune": "#577dff"}
+    elapsed = (day - date(2000, 1, 1)).days
+    positions = {"Sun": (0., 0., 0.)}
+    for index, name in enumerate(periods):
+        angle = 2 * np.pi * elapsed / periods[name] + index * .71
+        positions[name] = (radii[name] * np.cos(angle), radii[name] * np.sin(angle), 0.)
+    return positions
+
+
+def solar_system_figure(day: date, highlighted: str):
+    positions = _local_preview_positions(day)
     fig = go.Figure()
-    # Actual Gaia positions are only queried after the user asks for them.
-    if stars:
-        ra = np.radians([s["ra"] for s in stars])
-        dec = np.radians([s["dec"] for s in stars])
-        mag = np.asarray([s["mag"] for s in stars])
-        radius = 45
-        fig.add_trace(go.Scatter3d(x=radius*np.cos(dec)*np.cos(ra), y=radius*np.cos(dec)*np.sin(ra), z=radius*np.sin(dec),
-            mode="markers", name="Gaia DR3 stars", hoverinfo="skip",
-            marker=dict(size=np.clip(4.5-mag*.45, 1, 3.5), color="#f5f2e8", opacity=.7)))
-
-    day_offset = (day - date(2000, 1, 1)).days
-    for body in PLANETS:
-        name, body_id, color, size = body[0], body[1], body[8], body[9]
-        x, y, z = positions.get(name, _kepler_position(body, day_offset)) if use_horizons else _kepler_position(body, day_offset)
-        trail_offsets = np.linspace(-trail_days // 2, trail_days // 2, 50)
-        trail = np.array([_kepler_position(body, day_offset + float(offset)) for offset in trail_offsets])
-        fig.add_trace(go.Scatter3d(x=trail[:, 0], y=trail[:, 1], z=trail[:, 2], mode="lines",
-            line=dict(color=color, width=2), name=f"{name} orbit", showlegend=False, hoverinfo="skip"))
-        distance = float(np.sqrt(x*x+y*y+z*z))
-        fig.add_trace(go.Scatter3d(x=[x], y=[y], z=[z], mode="markers+text", name=name,
-            text=[name], textposition="top center", marker=dict(size=size+(5 if name == selected else 0), color=color),
-            customdata=[[body_id, distance]], hovertemplate="<b>%{text}</b><br>Horizons ID %{customdata[0]}<br>Heliocentric distance %{customdata[1]:.4f} AU<extra></extra>"))
+    orbit_radii = {"Mercury": .387, "Venus": .723, "Earth": 1., "Mars": 1.524,
+                   "Jupiter": 5.203, "Saturn": 9.555, "Uranus": 19.218, "Neptune": 30.11}
+    colors = {"Mercury": "#b8b8b8", "Venus": "#f5c46b", "Earth": "#4da6ff", "Mars": "#ff7043",
+              "Jupiter": "#e8b17a", "Saturn": "#f2dc8c", "Uranus": "#83e3e3", "Neptune": "#577dff"}
+    for name, radius in orbit_radii.items():
+        angle = np.linspace(0, 2 * np.pi, 120)
+        fig.add_trace(go.Scatter3d(x=radius*np.cos(angle), y=radius*np.sin(angle), z=np.zeros_like(angle),
+                                   mode="lines", line=dict(color=colors[name], width=1),
+                                   name=f"{name} orbit (preview)", showlegend=False, hoverinfo="skip"))
+        x, y, z = positions[name]
+        fig.add_trace(go.Scatter3d(x=[x], y=[y], z=[z], mode="markers+text", name=name, text=[name],
+                                   textposition="top center", marker=dict(size=8+(4 if name == highlighted else 0), color=colors[name])))
     fig.add_trace(go.Scatter3d(x=[0], y=[0], z=[0], mode="markers+text", name="Sun", text=["Sun"],
-        textposition="top center", marker=dict(size=17, color="#ffd54f", line=dict(color="white", width=1)),
-        hovertemplate="Sun · heliocentric origin<extra></extra>"))
+                               textposition="top center", marker=dict(size=15, color="#ffd54f")))
     axis = dict(showbackground=False, showgrid=False, zeroline=False, showticklabels=False, title="")
-    fig.update_layout(title=f"Solar System · {day.isoformat()}", paper_bgcolor="#02030a", plot_bgcolor="#02030a",
-        font=dict(color="white"), margin=dict(l=0, r=0, b=0, t=45),
-        scene=dict(xaxis=axis, yaxis=axis, zaxis=axis, aspectmode="data", camera=dict(eye=dict(x=1.5,y=1.5,z=1.1))))
+    fig.update_layout(title=f"Solar System preview · {day.isoformat()}", paper_bgcolor="#02030a",
+                      plot_bgcolor="#02030a", font=dict(color="white"), margin=dict(l=0, r=0, b=0, t=40),
+                      scene=dict(xaxis=axis, yaxis=axis, zaxis=axis, aspectmode="data"))
     return fig
 
 
-def main():
-    st.title("Solar System & Infrared Archive")
-    st.caption("The page renders immediately. Network requests run only after you press their buttons.")
-    with st.sidebar:
-        st.header("View controls")
-        chosen_day = st.date_input("Date (UTC)", value=date.today())
-        planet = st.selectbox("Highlight planet", ["None"] + [p[0] for p in PLANETS])
-        trail_days = st.select_slider("Orbit trail (days)", options=[30, 90, 180], value=90)
-        fetch_live = st.button("Fetch precise positions from JPL Horizons", type="primary")
-        fetch_stars = st.button("Load real Gaia DR3 star background")
-        st.caption("Initial positions are fast local Kepler estimates. Horizons and Gaia are opt-in so a slow archive cannot block page startup.")
-
-    date_text = chosen_day.isoformat()
-    if fetch_live:
-        with st.spinner("Requesting JPL Horizons (bounded network timeout)…"):
-            live_positions, errors = fetch_horizons_positions(date_text)
-        st.session_state["horizons_date"] = date_text
-        st.session_state["horizons_positions"] = live_positions
-        st.session_state["horizons_errors"] = errors
-    positions = st.session_state.get("horizons_positions", {})
-    use_horizons = st.session_state.get("horizons_date") == date_text and bool(positions)
-    if st.session_state.get("horizons_date") == date_text and st.session_state.get("horizons_errors"):
-        st.warning("Some Horizons calls failed: " + "; ".join(st.session_state["horizons_errors"]))
-
-    if fetch_stars:
-        with st.spinner("Loading Gaia DR3 stars (bounded network timeout)…"):
-            stars, error = fetch_gaia_stars(1500)
-        st.session_state["gaia_stars"] = stars
-        st.session_state["gaia_error"] = error
-    stars = st.session_state.get("gaia_stars", [])
-    if st.session_state.get("gaia_error"):
-        st.warning(f"Gaia is temporarily unavailable: {st.session_state['gaia_error']}")
-
-    st.plotly_chart(make_figure(chosen_day, positions, use_horizons, planet, int(trail_days), stars),
-                    use_container_width=True, config={"displaylogo": False, "scrollZoom": True})
-    if use_horizons:
-        st.success(f"Showing JPL Horizons heliocentric vectors for {date_text}.")
+def show_observations(records: list[dict]):
+    st.success(f"IRSA returned {len(records)} actual SPHEREx archive product(s) in this sky area.")
+    wavelength_rows = []
+    for index, record in enumerate(records):
+        lo = _float_field(record, "em_min")
+        hi = _float_field(record, "em_max")
+        # Standard SIA spectral bounds are in meters; show microns.
+        if lo is not None and hi is not None and lo > 0 and hi > lo:
+            wavelength_rows.append((index + 1, lo * 1e6, hi * 1e6))
+    if wavelength_rows:
+        chart = go.Figure()
+        chart.add_trace(go.Bar(
+            x=[hi - lo for _, lo, hi in wavelength_rows],
+            base=[lo for _, lo, hi in wavelength_rows],
+            y=[f"Product {number}" for number, _, _ in wavelength_rows],
+            orientation="h", marker_color="#ff9f43",
+            hovertemplate="%{y}<br>Wavelength: %{base:.3f}–%{x:.3f} μm<extra></extra>",
+        ))
+        chart.update_layout(title="Observed SPHEREx product wavelength coverage (archive metadata)",
+                            xaxis_title="Wavelength (μm)", yaxis_title="Archive product",
+                            paper_bgcolor="#111827", plot_bgcolor="#111827", font_color="white",
+                            height=max(300, min(800, 28 * len(wavelength_rows) + 120)))
+        st.plotly_chart(chart, use_container_width=True)
     else:
-        st.info("Showing approximate orbital estimates, not live ephemerides. Press the JPL Horizons button for real positions.")
-    st.caption("Planet positions are heliocentric AU coordinates; planet sizes and orbit trails are not to scale. Gaia background stars are actual catalog directions on a compressed shell.")
+        st.info("Products were found, but IRSA did not return em_min/em_max wavelength bounds for plotting.")
 
-    st.subheader("Actual SPHEREx infrared observations")
-    st.write("Infrared measurements are archive products, not a single live value available for every planet. Search IRSA MOST for SPHEREx observations of moving Solar System objects; a result is shown only when the archive has matching data.")
-    target = st.text_input("Planet or Solar System object", value=planet if planet != "None" else "Mars")
-    st.link_button("Open NASA/IPAC IRSA MOST", "https://irsa.ipac.caltech.edu/applications/MOST/")
-    st.link_button("Open SPHEREx archive and data access", "https://irsa.ipac.caltech.edu/Missions/spherex.html")
-    st.caption("These official archive links are non-blocking. Use the target name above in MOST; no infrared value is invented when a matching observation is absent.")
+    display_rows = []
+    for index, record in enumerate(records):
+        display_rows.append({
+            "#": index + 1,
+            "Product": _column(record, "obs_id", "obs_publisher_did", "obs_title", "productID", "filename") or "SPHEREx data product",
+            "Type": _column(record, "dataproduct_type", "productType"),
+            "Wavelength min (μm)": (lambda x: round(x * 1e6, 4) if x and x > 0 else "")(_float_field(record, "em_min")),
+            "Wavelength max (μm)": (lambda x: round(x * 1e6, 4) if x and x > 0 else "")(_float_field(record, "em_max")),
+            "Observation time": _column(record, " t_min", "t_min", "obs_collection"),
+        })
+    st.dataframe(display_rows, use_container_width=True, hide_index=True)
+    st.markdown("**Archive product files**")
+    shown = 0
+    for index, record in enumerate(records):
+        product_url = _column(record, "access_url", "access_reference", "accessURL")
+        if product_url.startswith("http"):
+            title = _column(record, "obs_id", "obs_title", "filename") or f"SPHEREx product {index + 1}"
+            st.link_button(f"Open/download: {title[:90]}", product_url)
+            shown += 1
+            if shown >= 20:
+                break
+    if not shown:
+        st.caption("IRSA returned no direct access_url in the response. Open the IRSA archive result details for product access.")
+    st.warning("These are real SPHEREx archive products and measured wavelength coverage, not fabricated planet fluxes. A product may be a spectral image/cube; extracting a calibrated per-planet spectrum requires processing the FITS product and checking that the target is actually in the field.")
+
+
+def main():
+    st.title("SPHEREx Infrared Solar System Explorer")
+    st.caption("The app renders immediately. It queries JPL Horizons and NASA/IPAC IRSA only when you submit a search.")
+    with st.sidebar:
+        st.header("Solar System")
+        selected = st.selectbox("Highlight planet by name", ["None", *[n for n in PLANET_IDS if n != "Sun"]])
+        observed_on = st.date_input("Observation date (UTC)", value=date.today())
+        st.caption("The chart is a quick illustrative preview. Archive search below uses the selected date and a real Horizons apparent position.")
+
+    st.plotly_chart(solar_system_figure(observed_on, selected), use_container_width=True,
+                    config={"displaylogo": False, "scrollZoom": True})
+    st.caption("Illustrative orbit preview only — not precise ephemerides and not infrared imagery.")
+
+    st.header("Actual infrared archive search")
+    st.write("Resolve a Solar System object with NASA/JPL Horizons, then search the official SPHEREx SIA archive for real spectral-image products around its apparent sky position. Any Horizons-recognized name, NAIF ID, asteroid, or comet may be tried; results depend on actual survey coverage.")
+    default_target = selected if selected != "None" else "Mars"
+    with st.form("infrared_search"):
+        target = st.text_input("Object name or Horizons ID", value=default_target,
+                               help="Examples: Mars, Jupiter, 499, Ceres, or another Horizons target.")
+        radius = st.select_slider("Search radius around target", options=[0.02, 0.05, 0.1, 0.25], value=0.1,
+                                  format_func=lambda value: f"{value}°")
+        submit = st.form_submit_button("Find real SPHEREx infrared observations", type="primary")
+
+    if submit:
+        if not target.strip():
+            st.error("Enter a planet/object name or Horizons ID.")
+        else:
+            try:
+                with st.spinner("Resolving apparent target position with JPL Horizons…"):
+                    ra, dec = _horizons_apparent_radec(target.strip(), observed_on)
+                st.write(f"**{target.strip()}** on {observed_on.isoformat()}: RA {ra:.5f}°, Dec {dec:.5f}°")
+                with st.spinner("Searching NASA/IPAC IRSA SPHEREx data (request has a timeout)…"):
+                    products = query_spherex_at_position(ra, dec, float(radius))
+                if products:
+                    show_observations(products)
+                else:
+                    st.info("No SPHEREx products were returned at this position/radius. Try a wider radius or another observation date. No fake infrared points are substituted.")
+            except requests.Timeout:
+                st.error("The archive timed out. The page remains available; retry in a moment or use the IRSA links below.")
+            except requests.RequestException as exc:
+                st.error(f"A NASA service could not be reached: {exc}")
+            except Exception as exc:
+                st.error(f"Could not complete the target/archive search: {exc}")
+
+    st.markdown("Official resources: [IRSA SPHEREx archive](https://irsa.ipac.caltech.edu/Missions/spherex.html) · [IRSA MOST moving-object search](https://irsa.ipac.caltech.edu/applications/MOST/) · [JPL Horizons API](https://ssd.jpl.nasa.gov/api/horizons.api.html)")
 
 
 if __name__ == "__main__":
