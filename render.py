@@ -11,6 +11,7 @@ from astropy.table import Table
 from astropy.coordinates import SkyCoord
 from astropy.cosmology import Planck18 as cosmo
 import astropy.units as u
+from astroquery.ipac.irsa import Irsa
 
 """ 
   BOILERPLATE CODE TO RENDER PLANETS(CREATED AS A BOILERPLATE BEFOREHAND;
@@ -84,62 +85,16 @@ def create_space_scene(title="3D Space Renderer", num_bg_stars=400, bg_radius=50
    return fig
 
 
-def render_spherex_table(fig, filepath, ra_col="RA", dec_col="DEC", z_col="Z", ir_col=None, max_rows=25000):
-   if filepath.endswith((".fits", ".fit")):
-       max_retries = 3
-       df = None
-       for attempt in range(max_retries):
-           try:
-               with fits.open(filepath, memmap=False) as hdulist:
-                   # Tries extension 1 first, falls back to 0 if needed
-                   ext_idx = 1 if len(hdulist) > 1 else 0
-                   df = Table(hdulist[ext_idx].data).to_pandas()
-               break
-           except (TimeoutError, urllib.error.HTTPError, http.client.IncompleteRead):
-               if attempt == max_retries - 1:
-                   raise
-               time.sleep(10 * (attempt + 1))
-       
-       if df is None:
-           df = Table.read(filepath).to_pandas()
-   else:
-       df = pd.read_csv(filepath)
-
-   cols = [ra_col, dec_col, z_col] + ([ir_col] if ir_col else [])
-   df = df[cols].dropna().head(max_rows)
-
-   distances = cosmo.comoving_distance(df[z_col].values)
-   coords = SkyCoord(
-       ra=df[ra_col].values * u.deg,
-       dec=df[dec_col].values * u.deg,
-       distance=distances
-   )
-
-   color_values = df[ir_col] if ir_col else df[z_col]
-   color_label = ir_col if ir_col else "Redshift (z)"
-
-   fig.add_trace(go.Scatter3d(
-       x=coords.cartesian.x.value,
-       y=coords.cartesian.y.value,
-       z=coords.cartesian.z.value,
-       mode="markers",
-       name="SPHEREx Infrared Sources",
-       hovertemplate=(
-           f"<b>SPHEREx Object</b><br>"
-           f"RA: %{{customdata[0]:.3f}}°<br>"
-           f"Dec: %{{customdata[1]:.3f}}°<br>"
-           f"{color_label}: %{{customdata[2]:.3f}}<extra></extra>"
-       ),
-       customdata=np.stack((df[ra_col].values, df[dec_col].values, color_values.values), axis=-1),
-       marker=dict(
-           size=2.5,
-           color=color_values,
-           colorscale="Inferno",
-           colorbar=dict(title=color_label, x=0.92),
-           opacity=0.85
-       )
-   ))
-   return fig
+def render_spherex_live_nasa(fig, ra_deg=304.6935, dec_deg=42.4436, max_rows=25000):
+    coord = SkyCoord(ra_deg, dec_deg, unit="deg")
+    search_radius = 1 * u.arsec
+    print(f"Sending HTTPS request to NASA IRSA for values: RA, {ra_deg}, Dec: {dec_deg}...")
+    results = Irsa.query_sia(pos=(coord, search_radius), collection = ['spherex_dr1', 'spherex_qr3'])
+    if len(results) = 0:
+        raise ValueError("No SPHEREx data found for these coordinates.")
+    df = results.to_table().to_pandas().head(max_rows)
+    ra_col  = 's_ra'
+    dec_col = 's_deg'
 
 
 if __name__ == "__main__":
