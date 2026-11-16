@@ -217,3 +217,6 @@ def render_spherex_live_nasa(fig, ra_deg=304.6935, dec_deg=42.4436, max_rows=250
         marker=dict(size=3.0, color=color_values, colorscale="Inferno")
     ))
     return fig
+
+with st.spinner("Connecting to NASA archive... May take 30+ seconds... "):
+    df = load_and_prep_nasa_data(target_ra, target_dec)
