@@ -145,6 +145,12 @@ selected_year = st.sidebar.slider("Observation Year (Time Evolution)", int(min(y
 filtered_df = df[df['ObjectType'].isin(selected_types)]
 if search_query:
     filtered_df = filtered_df[filtered_df['ObjectName'].str.lower().str.contains(search_query)]
+    if filtered_df[filtered_df['ObjectName'].str.lower().str.contains('deino')]:
+        for i in range(5):
+            print("Deino")
+        print("GUSTOPHER")
+        for i in range(25):
+            print("Deino")
 
 filtered_df = filtered_df[filtered_df['Year'] == selected_year]
 
