@@ -20,7 +20,7 @@ GAIA_URL = "https://gea.esac.esa.int/tap-server/tap/sync"
 # name, Horizons ID, a(AU), e, inclination, mean longitude, longitude perihelion,
 # longitude ascending node, color, marker size
 PLANETS = [
-    ("Mercury", "199", .387099, .205636, 7.005, 252.251, 77.ев, 48.331, "#b8b8b8", 4),
+    ("Mercury", "199", .387099, .205636, 7.005, 252.251, 77.456, 48.331, "#b8b8b8", 4),
     ("Venus", "299", .723332, .006772, 3.395, 181.980, 131.602, 76.680, "#f5c46b", 6),
     ("Earth", "399", 1.000000, .016708, 0.000, 100.464, 102.937, 0.000, "#4da6ff", 7),
     ("Mars", "499", 1.523679, .093400, 1.849, 355.453, 336.041, 49.558, "#ff7043", 5),
@@ -121,7 +121,6 @@ def make_figure(day: date, positions: dict, use_horizons: bool, selected: str,
             marker=dict(size=np.clip(4.5-mag*.45, 1, 3.5), color="#f5f2e8", opacity=.7)))
 
     day_offset = (day - date(2000, 1, 1)).days
-    scale = 1.0
     for body in PLANETS:
         name, body_id, color, size = body[0], body[1], body[8], body[9]
         x, y, z = positions.get(name, _kepler_position(body, day_offset)) if use_horizons else _kepler_position(body, day_offset)
