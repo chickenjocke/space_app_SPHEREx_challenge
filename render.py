@@ -1,156 +1,275 @@
+from __future__ import annotations
+
+import csv
+import io
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
+
 import numpy as np
-import pandas as pd
 import plotly.graph_objects as go
-from astropy.coordinates import SkyCoord
-from astropy.cosmology import Planck18 as cosmo
-import astropy.units as u
+import requests
 import streamlit as st
 
-st.set_page_config(page_title="INFRARED SKY MAP", layout="wide")
+st.set_page_config(page_title="REAL SOLAR SYSTEM SKY MAP", layout="wide")
+
+HORIZONS_URL = "https://ssd.jpl.nasa.gov/api/horizons.api"
+GAIA_TAP_URL = "https://gea.esac.esa.int/tap-server/tap/sync"
+# Horizons numeric IDs for the planetary centers. The Sun itself is drawn at the origin.
+PLANETS = [
+    ("Mercury", "199", "#b8b8b8", 4),
+    ("Venus", "299", "#f5c46b", 6),
+    ("Earth", "399", "#4da6ff", 7),
+    ("Mars", "499", "#ff7043", 5),
+    ("Jupiter", "599", "#e8b17a", 12),
+    ("Saturn", "699", "#f2dc8c", 10),
+    ("Uranus", "799", "#83e3e3", 8),
+    ("Neptune", "899", "#577dff", 8),
+]
 
 
-@st.cache_data
+def _vector_for_target(target_id: str, start: str, stop: str) -> dict:
+    """Fetch one real heliocentric JPL Horizons vector, with a bounded network wait."""
+    params = {
+        "format": "json",
+        "COMMAND": f"'{target_id}'",
+        "OBJ_DATA": "'YES'",
+        "MAKE_EPHEM": "'YES'",
+        "EPHEM_TYPE": "'VECTORS'",
+        "CENTER": "'500@10'",
+        "REF_PLANE": "'FRAME'",
+        "VEC_TABLE": "'2'",
+        "OUT_UNITS": "'AU-D'",
+        "CSV_FORMAT": "'YES'",
+        "START_TIME": f"'{start}'",
+        "STOP_TIME": f"'{stop}'",
+        "STEP_SIZE": "'1 d'",
+    }
+    response = requests.get(HORIZONS_URL, params=params, timeout=(3, 8))
+    response.raise_for_status()
+    payload = response.json()
+    text = payload.get("result", "")
+    if not text or "$$SOE" not in text or "$$EOE" not in text:
+        raise ValueError(payload.get("error", "JPL Horizons returned no vector data."))
 
-def load_demo_data():
-    """Create a small deterministic offline dataset so the app never waits on a remote archive."""
-    rng = np.random.default_rng(101)
-    n_points = 350
-    df = pd.DataFrame(
-        {
-            "RA": rng.uniform(300, 310, n_points),
-            "DEC": rng.uniform(40, 45, n_points),
-            "IR_Flux": rng.uniform(0.75, 5.0, n_points),
-            "Z": rng.uniform(0.1, 2.5, n_points),
-            "Year": rng.choice([2025, 2026, 2027], n_points),
-            "ObjectType": rng.choice(
-                ["Planet", "Star", "Galaxy"], n_points, p=[0.15, 0.45, 0.40]
-            ),
+    table_text = text.split("$$SOE", 1)[1].split("$$EOE", 1)[0].strip()
+    rows = list(csv.reader(io.StringIO(table_text)))
+    for row in rows:
+        # CSV vector rows start with Julian date and calendar date, then X, Y, Z.
+        if len(row) >= 5:
+            try:
+                return {"x": float(row[2]), "y": float(row[3]), "z": float(row[4])}
+            except (TypeError, ValueError):
+                continue
+    raise ValueError("Could not parse the JPL Horizons vector response.")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_solar_system(date_utc: str) -> tuple[list[dict], list[str]]:
+    """Fetch the planets concurrently; successful results are cached for one hour."""
+    start = f"{date_utc} 00:00"
+    next_day = (datetime.strptime(date_utc, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+    stop = f"{next_day} 00:00"
+    bodies = [{"name": "Sun", "id": "10", "x": 0.0, "y": 0.0, "z": 0.0, "color": "#ffd54f", "size": 18}]
+    errors = []
+    with ThreadPoolExecutor(max_workers=len(PLANETS)) as pool:
+        tasks = {
+            pool.submit(_vector_for_target, body_id, start, stop): (name, body_id, color, size)
+            for name, body_id, color, size in PLANETS
         }
+        for task in as_completed(tasks):
+            name, body_id, color, size = tasks[task]
+            try:
+                vector = task.result()
+                bodies.append({"name": name, "id": body_id, **vector, "color": color, "size": size})
+            except Exception as exc:
+                errors.append(f"{name} (Horizons ID {body_id}): {exc}")
+    return bodies, errors
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_gaia_background(limit: int = 2500) -> tuple[list[dict], str | None]:
+    """Load real all-sky Gaia DR3 star positions for a sparse, bright night-sky layer."""
+    query = (
+        "SELECT TOP " + str(int(limit)) + " ra,dec,phot_g_mean_mag "
+        "FROM gaiadr3.gaia_source WHERE phot_g_mean_mag < 6.5 "
+        "AND ra IS NOT NULL AND dec IS NOT NULL ORDER BY phot_g_mean_mag ASC"
     )
-    df["ObjectName"] = [f"{kind}-{i + 1}" for i, kind in enumerate(df["ObjectType"])]
-    return df
+    try:
+        response = requests.get(
+            GAIA_TAP_URL,
+            params={"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "csv", "QUERY": query},
+            timeout=(3, 8),
+        )
+        response.raise_for_status()
+        rows = list(csv.DictReader(io.StringIO(response.text)))
+        stars = [
+            {"ra": float(row["ra"]), "dec": float(row["dec"]), "mag": float(row["phot_g_mean_mag"])}
+            for row in rows
+            if row.get("ra") and row.get("dec") and row.get("phot_g_mean_mag")
+        ]
+        return stars, None
+    except Exception as exc:
+        return [], str(exc)
 
 
-def create_space_scene(title, num_bg_stars=250, bg_radius=8000):
-    rng = np.random.default_rng(42)
-    phi = rng.uniform(0, 2 * np.pi, num_bg_stars)
-    costheta = rng.uniform(-1, 1, num_bg_stars)
-    theta = np.arccos(costheta)
-    radius = rng.uniform(bg_radius * 0.8, bg_radius, num_bg_stars)
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_gaia_star(source_id: str) -> dict:
+    """Resolve one Gaia DR3 source ID to its real sky position and parallax."""
+    if not source_id.isdigit():
+        raise ValueError("Enter the numeric Gaia DR3 source_id for a star.")
+    query = (
+        "SELECT TOP 1 source_id,ra,dec,parallax,phot_g_mean_mag "
+        "FROM gaiadr3.gaia_source WHERE source_id=" + source_id
+    )
+    response = requests.get(
+        GAIA_TAP_URL,
+        params={"REQUEST": "doQuery", "LANG": "ADQL", "FORMAT": "csv", "QUERY": query},
+        timeout=(3, 8),
+    )
+    response.raise_for_status()
+    rows = list(csv.DictReader(io.StringIO(response.text)))
+    if not rows:
+        raise ValueError("No Gaia DR3 source was found with that ID.")
+    row = rows[0]
+    return {
+        "id": row["source_id"],
+        "ra": float(row["ra"]),
+        "dec": float(row["dec"]),
+        "parallax": float(row["parallax"]) if row.get("parallax") else float("nan"),
+        "mag": float(row["phot_g_mean_mag"]) if row.get("phot_g_mean_mag") else float("nan"),
+    }
 
-    fig = go.Figure(
+
+def add_star_sky(fig, stars: list[dict], radius: float = 80.0):
+    """Plot real Gaia sky directions on a compressed shell so planets remain visible."""
+    if not stars:
+        return
+    ra = np.radians([star["ra"] for star in stars])
+    dec = np.radians([star["dec"] for star in stars])
+    x = radius * np.cos(dec) * np.cos(ra)
+    y = radius * np.cos(dec) * np.sin(ra)
+    z = radius * np.sin(dec)
+    mags = np.array([star["mag"] for star in stars])
+    sizes = np.clip(5.2 - mags * 0.55, 1.2, 4.0)
+    fig.add_trace(
         go.Scatter3d(
-            x=radius * np.sin(theta) * np.cos(phi),
-            y=radius * np.sin(theta) * np.sin(phi),
-            z=radius * np.cos(theta),
-            mode="markers",
-            name="Background stars",
-            hoverinfo="skip",
-            marker=dict(size=1.5, color="white", opacity=0.8),
+            x=x, y=y, z=z, mode="markers", name="Gaia DR3 stars (sky directions)",
+            text=[f"Gaia DR3 star · G={mag:.2f}" for mag in mags],
+            hovertemplate="%{text}<extra></extra>",
+            marker=dict(size=sizes, color="#f4f3e8", opacity=0.82),
         )
     )
-    no_axis = dict(showbackground=False, showgrid=False, zeroline=False, showticklabels=False, title="")
+
+
+def make_figure(bodies: list[dict], stars: list[dict], target_star: dict | None = None):
+    fig = go.Figure()
+    add_star_sky(fig, stars)
+    if target_star:
+        ra, dec = np.radians(target_star["ra"]), np.radians(target_star["dec"])
+        radius = 80.0
+        parallax = target_star["parallax"]
+        parallax_text = f"{parallax:.3f} mas" if np.isfinite(parallax) else "unavailable"
+        fig.add_trace(
+            go.Scatter3d(
+                x=[radius * np.cos(dec) * np.cos(ra)],
+                y=[radius * np.cos(dec) * np.sin(ra)],
+                z=[radius * np.sin(dec)],
+                mode="markers+text", name="Selected Gaia star",
+                text=[f"Gaia {target_star['id']}"], textposition="top center",
+                marker=dict(size=10, color="#ff66cc", symbol="diamond"),
+                customdata=[[target_star["ra"], target_star["dec"], parallax_text, target_star["mag"]]],
+                hovertemplate=("Gaia DR3 %{text}<br>RA %{customdata[0]:.5f}° · Dec %{customdata[1]:.5f}°"
+                               "<br>Parallax %{customdata[2]} · G %{customdata[3]:.2f}<extra></extra>"),
+            )
+        )
+
+    if bodies:
+        fig.add_trace(
+            go.Scatter3d(
+                x=[body["x"] for body in bodies], y=[body["y"] for body in bodies],
+                z=[body["z"] for body in bodies], mode="markers+text", name="JPL Horizons bodies",
+                text=[body["name"] for body in bodies], textposition="top center",
+                marker=dict(size=[body["size"] for body in bodies], color=[body["color"] for body in bodies],
+                            line=dict(color="white", width=0.5)),
+                customdata=[[body["id"], np.sqrt(body["x"]**2 + body["y"]**2 + body["z"]**2)] for body in bodies],
+                hovertemplate=("<b>%{text}</b><br>Horizons ID %{customdata[0]}<br>"
+                               "Heliocentric distance %{customdata[1]:.4f} AU<extra></extra>"),
+            )
+        )
+
+    axis = dict(showbackground=False, showgrid=False, zeroline=False, showticklabels=False, title="")
     fig.update_layout(
-        title=title,
-        paper_bgcolor="black",
-        plot_bgcolor="black",
-        font=dict(color="white"),
-        margin=dict(l=0, r=0, b=0, t=40),
-        scene=dict(xaxis=no_axis, yaxis=no_axis, zaxis=no_axis, aspectmode="data"),
+        title="Real Solar System · JPL Horizons + Gaia DR3",
+        paper_bgcolor="#02030a", plot_bgcolor="#02030a", font=dict(color="white"),
+        margin=dict(l=0, r=0, b=0, t=45),
+        legend=dict(bgcolor="rgba(0,0,0,0.35)"),
+        scene=dict(xaxis=axis, yaxis=axis, zaxis=axis, aspectmode="data",
+                   camera=dict(eye=dict(x=1.5, y=1.5, z=1.1))),
     )
     return fig
 
 
 def main():
-    st.sidebar.title("SPHEREx Control Hub")
-    st.sidebar.caption("Offline demo data loads immediately; no NASA archive request is made at startup.")
-    target_ra = st.sidebar.number_input("Target RA (°)", value=304.6935)
-    target_dec = st.sidebar.number_input("Target Dec (°)", value=42.4436)
+    st.title("Real Solar System & Night Sky")
+    st.caption("Planet positions: NASA/JPL Horizons · Background and star lookup: ESA Gaia DR3")
+    st.sidebar.header("Explore")
+    mode = st.sidebar.radio("View", ["Solar system", "Look up a star (Gaia DR3)"])
+    star_id = ""
+    if mode == "Look up a star (Gaia DR3)":
+        st.sidebar.markdown("Enter a **Gaia DR3 source_id**. The complete Solar System stays in view.")
+        with st.sidebar.form("star_lookup"):
+            star_id = st.text_input("Gaia DR3 source_id", placeholder="For example: 5853498713190525696")
+            lookup = st.form_submit_button("Find star")
+        if lookup and star_id.strip():
+            st.session_state["selected_gaia_id"] = star_id.strip()
 
-    # Keep controls meaningful while keeping this offline demo responsive.
-    df = load_demo_data().copy()
-    ra_offset = target_ra - 304.6935
-    dec_offset = target_dec - 42.4436
-    df["RA"] = (df["RA"] + ra_offset) % 360
-    df["DEC"] = (df["DEC"] + dec_offset).clip(-90, 90)
+    date_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    st.caption(f"Ephemeris date: {date_utc} UTC · Planet markers are enlarged; the star shell is compressed, not to scale.")
+    with st.spinner("Fetching today's planetary positions from JPL Horizons and the Gaia star catalog…"):
+        bodies, body_errors = fetch_solar_system(date_utc)
+        stars, star_error = fetch_gaia_background()
 
-    search_query = st.sidebar.text_input(
-        "Search Object Name (e.g., Planet-1, Star-12)", ""
-    ).strip().lower()
-    object_types = ["Planet", "Star", "Galaxy"]
-    selected_types = st.sidebar.multiselect(
-        "Filter Object Types", object_types, default=object_types
+    selected_star = None
+    selected_id = st.session_state.get("selected_gaia_id")
+    if mode == "Look up a star (Gaia DR3)" and selected_id:
+        try:
+            with st.spinner("Looking up the Gaia DR3 star…"):
+                selected_star = fetch_gaia_star(selected_id)
+        except Exception as exc:
+            st.error(f"Could not load that Gaia star: {exc}")
+
+    if not bodies:
+        st.error("JPL Horizons could not be reached, so current planet positions are unavailable. Check network access and retry.")
+        if body_errors:
+            with st.expander("Horizons request details"):
+                st.write("\n".join(body_errors))
+    else:
+        st.success(f"Loaded {len(bodies)} Solar System bodies from JPL Horizons.")
+    if body_errors:
+        st.warning("Some planet requests failed: " + "; ".join(body_errors))
+    if star_error:
+        st.warning(f"Gaia's real star catalog is temporarily unavailable: {star_error}. Planet positions are still shown.")
+    elif stars:
+        st.caption(f"Background contains {len(stars):,} real, bright Gaia DR3 star positions (the all-sky directions are shown on a compressed shell).")
+
+    st.plotly_chart(make_figure(bodies, stars, selected_star), use_container_width=True,
+                    config={"displaylogo": False, "scrollZoom": True})
+
+    st.subheader("Infrared observations (real mission data)")
+    st.info(
+        "JPL Horizons provides real positions, not measured infrared spectra or fluxes. There is no single "
+        "uniform real-time infrared measurement for every planet/star. To avoid inventing values, this map "
+        "does not label modeled colors as observed infrared data. Search actual mission observations in the "
+        "NASA Planetary Data System and NASA/IPAC Infrared Science Archive below. Those observations are "
+        "instrument-, wavelength-, date-, and target-specific."
     )
-    years_available = sorted(df["Year"].unique())
-    selected_year = st.sidebar.slider(
-        "Observation Year (Time Evolution)",
-        int(min(years_available)),
-        int(max(years_available)),
+    st.markdown(
+        "- [NASA Planetary Data System (PDS)](https://pds.nasa.gov/) — spacecraft observations and calibrated products.\n"
+        "- [NASA/IPAC Infrared Science Archive (IRSA)](https://irsa.ipac.caltech.edu/) — infrared mission archives.\n"
+        "- [JPL Horizons API documentation](https://ssd.jpl.nasa.gov/api/horizons.api.html) — ephemerides used for positions.\n"
+        "- [ESA Gaia Archive](https://gea.esac.esa.int/archive/) — real star positions used in the background."
     )
-
-    filtered_df = df[df["ObjectType"].isin(selected_types)]
-    if search_query:
-        filtered_df = filtered_df[
-            filtered_df["ObjectName"].str.lower().str.contains(search_query, regex=False)
-        ]
-    filtered_df = filtered_df[filtered_df["Year"] == selected_year].copy()
-
-    st.title("SPHEREx 3D Time-Evolving Infrared Sky Map")
-    st.info("Showing a deterministic offline demo dataset, not live NASA archive results.")
-
-    if filtered_df.empty:
-        st.warning("No objects match these filters. Try another year or clear your search.")
-        st.plotly_chart(
-            create_space_scene(f"Sky Map ({selected_year}) - Empty"),
-            use_container_width=True,
-        )
-        return
-
-    st.markdown(f"Displaying **{len(filtered_df)}** demo sources for **{selected_year}**.")
-    distances = cosmo.comoving_distance(filtered_df["Z"].to_numpy())
-    coords = SkyCoord(
-        ra=filtered_df["RA"].to_numpy() * u.deg,
-        dec=filtered_df["DEC"].to_numpy() * u.deg,
-        distance=distances,
-    )
-    filtered_df["cart_x"] = coords.cartesian.x.value
-    filtered_df["cart_y"] = coords.cartesian.y.value
-    filtered_df["cart_z"] = coords.cartesian.z.value
-
-    fig = create_space_scene(f"Sky Map ({selected_year})")
-    fig.add_trace(
-        go.Scatter3d(
-            x=filtered_df["cart_x"],
-            y=filtered_df["cart_y"],
-            z=filtered_df["cart_z"],
-            mode="markers",
-            name="Demo targets",
-            text=filtered_df["ObjectName"],
-            hovertemplate=(
-                "<b>%{text}</b><br>"
-                "RA: %{customdata[0]:.3f}°<br>"
-                "Dec: %{customdata[1]:.3f}°<br>"
-                "Infrared Flux: %{customdata[2]:.2f} MJy/sr<br>"
-                "Year: %{customdata[3]}<extra></extra>"
-            ),
-            customdata=np.column_stack(
-                [
-                    filtered_df["RA"],
-                    filtered_df["DEC"],
-                    filtered_df["IR_Flux"],
-                    filtered_df["Year"],
-                ]
-            ),
-            marker=dict(
-                size=4,
-                color=filtered_df["IR_Flux"],
-                colorscale="Inferno",
-                colorbar=dict(title="IR Flux (MJy/sr)"),
-                opacity=0.95,
-            ),
-        )
-    )
-    st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
 
 
 if __name__ == "__main__":
