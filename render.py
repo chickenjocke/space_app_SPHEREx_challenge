@@ -91,7 +91,7 @@ def render_spherex_table(fig, filepath, ra_col="RA", dec_col="DEC", z_col="Z", i
        for attempt in range(max_retries):
            try:
                with fits.open(filepath, memmap=False) as hdulist:
-                   # Tries extension 1 first, falls back to 0 if needed # ai generated
+                   # Tries extension 1 first, falls back to 0 if needed
                    ext_idx = 1 if len(hdulist) > 1 else 0
                    df = Table(hdulist[ext_idx].data).to_pandas()
                break
