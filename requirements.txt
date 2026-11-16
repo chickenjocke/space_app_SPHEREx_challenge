@@ -5,3 +5,4 @@ astropy
 astroquery
 matplotlib
 streamlit
+scipy
